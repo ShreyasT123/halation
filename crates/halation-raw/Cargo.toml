@@ -1,0 +1,9 @@
+﻿[package]
+name = "halation-raw"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,12 @@
+﻿[package]
+name = "halation-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+halation-color = { workspace = true }
+halation-raw = { workspace = true }
+halation-gpu = { workspace = true }
+rayon = { workspace = true }
+blake3 = { workspace = true }

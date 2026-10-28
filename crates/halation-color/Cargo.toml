@@ -1,0 +1,10 @@
+﻿[package]
+name = "halation-color"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+glam = { workspace = true }
+moxcms = { workspace = true }
+thiserror = { workspace = true }

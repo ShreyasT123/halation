@@ -1,0 +1,14 @@
+﻿[package]
+name = "halation-desktop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+halation-ui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+iced = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
