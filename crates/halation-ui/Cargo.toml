@@ -10,4 +10,7 @@ halation-raw = { workspace = true }
 halation-gpu = { workspace = true }
 halation-pipeline = { workspace = true }
 halation-catalog = { workspace = true }
+halation-ml = { workspace = true }
 iced = { workspace = true }
+rfd = { workspace = true }
+tokio = { workspace = true }

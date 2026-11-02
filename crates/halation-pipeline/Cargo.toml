@@ -9,4 +9,5 @@ halation-color = { workspace = true }
 halation-raw = { workspace = true }
 halation-gpu = { workspace = true }
 rayon = { workspace = true }
+image = { workspace = true }
 blake3 = { workspace = true }

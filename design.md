@@ -1,203 +1,241 @@
-# Halation: Software Architecture & Technical Design Document (SDD)
-**Document Version:** 1.0.0  
-**Status:** Canonical Implementation Blueprint  
-**Target Architecture:** Windows 64-bit (DirectX 12 / Vulkan), macOS (Metal), Linux (Vulkan)  
-**Rust Edition:** 2021 (Workspace Resolver 2)
+# Halation Desktop: Software Architecture & Technical Design Document (SDD)
+**Document Version:** 2.0.0 (Corrected Canonical Blueprint)  
+**Status:** Approved for Implementation  
+**Target Architectures:** Windows 10/11 64-bit (DirectX 12 / Vulkan), macOS 14+ (Metal), Linux x86_64 (Vulkan)  
+**Workspace Configuration:** Rust 2021 Multi-Crate Workspace (Resolver 2)
 
 ---
 
-## 1. Technical Stack & Library Rationale
+## 1. Workspace Topology & Crate Dependency Graph
 
-| Subsystem | Primary Crate | Features / Flags | Architectural Rationale & Tradeoffs |
-| :--- | :--- | :--- | :--- |
-| **UI Framework** | `iced` | `wgpu`, `canvas`, `image`, `svg` | Pure Rust, Elm architecture (unidirectional state flow), natively backed by `wgpu`. Unlike GPUI, it allows direct `wgpu` render pass integration. Unlike `egui`, it avoids CPU mesh re-tessellation on 100k catalog grids. |
-| **GPU Hardware API** | `wgpu` | `default` | Portable abstraction over DX12, Vulkan, and Metal. Shares the same device/queue across both UI presentation and compute image processing. |
-| **Linear Algebra** | `glam` | `bytemuck` | SIMD-accelerated math ($3 \times 3$, $4 \times 4$). The `bytemuck` feature allows zero-copy transmutation of matrices directly into raw bytes for GPU uniform buffers. |
-| **Scientific Math** | `faer` | `default` | High-performance linear algebra for polynomial regression (lens distortion calibration) and chromatic adaptation solves. Outperforms OpenBLAS without C linkage. |
-| **Color Management** | `moxcms` | `lut` | Pure-Rust LittleCMS alternative. Parses ICC profiles, builds 3D tetrahedral LUTs, and runs color transforms without linking external C dependencies. |
-| **CPU Parallelism** | `rayon` | `default` | Work-stealing thread pool for tile-based CPU demosaicing, draft rasterization, and batch exports. |
-| **Async I/O Runtime** | `tokio` | `rt-multi-thread`, `macros`, `fs`, `io-util` | Asynchronous file ingestion, disk thumbnail reads, and database persistence decoupled from the UI thread. |
-| **Embedded Database** | `rusqlite` | `bundled` | Embedded ACID storage for catalog assets, tags, ratings, and develop histories. Compiles SQLite from source to prevent Windows DLL mismatch. |
-| **Fast Hashing** | `blake3` | `default` | High-throughput hashing (> 3 GB/s) for RAW file deduplication, tile cache keys, and develop state change detection. |
-| **Image Codecs** | `image`, `zune-image` | `png`, `jpeg`, `tiff`, `webp` | Fast image encoding/decoding. Pure-Rust codecs avoid C security vulnerabilities during thumbnail parsing. |
-| **Metadata Parser** | `kamadak-exif` | `default` | Zero-allocation, high-speed EXIF, TIFF, and MakerNote extraction from RAW headers. |
-| **File Dialogs** | `rfd` | `default` | Native Windows Win32/COM Open and Save file dialogs. |
-| **Platform Hooks** | `windows` | `Win32_Graphics_Gdi`, `Win32_Storage_FileSystem` | Windows-specific queries for active monitor ICC profiles (`GetICMProfileW`) and volume serial numbers. |
-
----
-
-## 2. Multi-Tier Concurrency & Threading Architecture
-
-Halation uses four distinct execution tiers to guarantee the main event loop never drops below 120 FPS:
+To prevent circular dependencies and isolate system-specific APIs, Halation is structured as a layered directed acyclic graph (DAG):
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 1. MAIN UI THREAD (Iced Event Loop)                                    │
-│    • Input events (Mouse, Keyboard, Scrubby Slider deltas)             │
-│    • Layout calculations (Taffy flexbox)                               │
-│    • Immediate parameter updates (< 1ms)                               │
-└───────────────────┬─────────────────────────────────┬──────────────────┘
-                    │ (Non-blocking Channel)          │ (Shared Arc)
-                    ▼                                 ▼
+apps/halation-desktop
+  │
+  ├──► crates/halation-ui (Iced 0.13, Custom Widgets, Layout)
+  │      │
+  │      ├──► crates/halation-pipeline (Frame Scheduler, Tile Engine)
+  │      │      │
+  │      │      ├──► crates/halation-gpu (wgpu 23, WGSL Shaders, Compute Queue)
+  │      │      ├──► crates/halation-color (moxcms, Colorimetric Solves, Bradford)
+  │      │      ├──► crates/halation-raw (libraw-sys, EXIF, Demosaicing)
+  │      │      └──► crates/halation-ml (ort 2.0, DirectML / CoreML, SAM Decoder)
+  │      │
+  │      ├──► crates/halation-catalog (SQLite WAL, Blake3 Indexing, XMP Engine)
+  │      └──► crates/halation-core (AST Types, Uniform Structs, ParamTransaction)
+  │
+  └── (Leaf Crates: halation-core, halation-color, halation-gpu, halation-raw)
+```
+
+### 1.1 Crate Responsibility Boundaries
+
+| Crate | Responsibilities | Forbidden Inclusions |
+| :--- | :--- | :--- |
+| `halation-core` | `GpuDevelopUniforms`, AST parameter models, `ParamTransaction`, history DAG node definitions. Zero runtime dependencies. | `wgpu`, `iced`, `rusqlite`, any I/O. |
+| `halation-raw` | Raw unpacking, CFA extraction via `libraw-sys`, fallback bitmap decoding (`image`, `zune-image`), EXIF extraction (`kamadak-exif`). | GPU allocations, UI types. |
+| `halation-color`| Bradford CAT matrix calculation, ProPhoto/ACES primaries, ICC parser, tetrahedral 3D display LUT builder (`moxcms`), platform display profile queries. | Raw disk I/O, UI rendering. |
+| `halation-gpu` | Device/Queue initialization, bind groups, WGSL compute pipelines, swapchain blitting, uniform ring-buffer allocations. | UI business logic, database queries. |
+| `halation-catalog` | SQLite WAL connection pooling, volume UUID resolution, relative path indexing, Adobe-compatible XMP serializer/deserializer. | GUI types, GPU compute types. |
+| `halation-pipeline`| Multi-tier tile pyramid ($512\text{ px}$ tiles), asynchronous thumbnail pre-fetching, Rayon CPU export runner. | OS windowing handles. |
+| `halation-ml` | Quantized on-device ONNX runtime (`ort`), background embedding generation, low-latency mask prompt decoding. | Network sockets, cloud APIs. |
+| `halation-ui` | Custom `iced::advanced::Widget` implementations (Scrubby Sliders, 5-zone Histogram, Spline Curve, 3-way Color Wheels), layout tree. | Direct filesystem mutations. |
+| `apps/halation-desktop`| Binary entrypoint, OS event loop bootstrap, platform initialization. | None (top-level coordinator). |
+
+---
+
+## 2. Multi-Tier Concurrency & Device Sharing Architecture
+
+### 2.1 Shared GPU Device Topology (`wgpu` + `iced_wgpu`)
+To eliminate texture copy overhead between the compute pipeline and display presentation, the compute pipeline and Iced **must** share the identical `wgpu::Device` and `wgpu::Queue`.
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │      wgpu::Instance (DX12/Metal/VK)     │
+                    └────────────────────┬────────────────────┘
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │  Shared Arc<wgpu::Device>, Arc<Queue>   │
+                    └───────────┬──────────────────┬──────────┘
+                                │                  │
+         (Dedicated Compute)    ▼                  ▼   (Presentation)
 ┌───────────────────────────────────────┐ ┌──────────────────────────────┐
-│ 2. GPU COMPUTE QUEUE (Dedicated)      │ │ 3. CPU WORKER POOL (Rayon)   │
-│    • 120 FPS Viewport Draft Compute   │ │    • RAW Demosaicing (AMAZE) │
-│    • 32-bit Float Shaders (WGSL)      │ │    • High-res 1:1 Tile Gen   │
-│    • 256-bin Histogram Generation     │ │    • CPU Draft Fallback      │
-│    • Display Gamut 3D LUT Blit        │ │    • Multi-core Export Jobs  │
+│ halation-gpu Compute Pipeline         │ │ iced_wgpu Presentation Engine│
+│ • Input: 32-bit Float RAW Tensor      │ │ • Custom shader::Program     │
+│ • Storage: Rgba16Float Viewport Buffer│ │ • Renders UI overlays        │
+│ • Blit Target: Shared Texture Atlas   │ │ • Direct Swapchain Blit      │
 └───────────────────────────────────────┘ └──────────────────────────────┘
-                    ▲                                 ▲
-                    │                                 │
-┌───────────────────┴─────────────────────────────────┴──────────────────┐
-│ 4. ASYNC BACKGROUND RUNTIME (Tokio)                                    │
-│    • Asynchronous RAW file ingestion from disk / SD card               │
-│    • SQLite database commits and vacuuming                             │
-│    • Disk thumbnail cache read/write (.halation-cache/)                │
-└────────────────────────────────────────────────────────────────────────┘
 ```
+
+```rust
+// crates/halation-gpu/src/device.rs
+use std::sync::Arc;
+use wgpu::{Device, Instance, Queue, Surface};
+
+pub struct GpuContext {
+    pub instance: Instance,
+    pub device: Arc<Device>,
+    pub queue: Arc<Queue>,
+}
+
+impl GpuContext {
+    pub async fn new_shared(surface_hint: Option<&Surface<'_>>) -> Result<Self, wgpu::RequestDeviceError> {
+        let instance = Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: surface_hint,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("Halation: Failed to acquire hardware GPU adapter");
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("Halation Primary Device"),
+                    required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                        | wgpu::Features::FLOAT32_FILTERABLE,
+                    required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await?;
+
+        Ok(Self {
+            instance,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        })
+    }
+}
+```
+
+### 2.2 Threading & Communication Primitives
+1. **Transient Slider Stream (UI $\to$ GPU):** 
+   - Uses an atomic ring buffer (`crossbeam::queue::ArrayQueue<GpuDevelopUniforms>`) with capacity 2.
+   - When scrubbing, the UI thread drops stale unrendered uniforms and writes the latest value.
+   - The GPU compute loop polls this queue at $120\text{ FPS}$ without blocking the UI thread.
+2. **Catalog / History Commits (UI $\to$ Background DB):** 
+   - A lock-free MPSC channel (`tokio::sync::mpsc::unbounded_channel`) dispatches `DbCommand::CommitDevelopState` on mouse release.
+3. **Tile Computation (Pipeline $\to$ Rayon):**
+   - Work-stealing Rayon pool using explicit priorities:
+     - `Priority::InteractiveLoupe` (Viewport visible tiles, preempts all other work).
+     - `Priority::ThumbnailPreload` (Visible grid buffer $\pm 2$ rows).
+     - `Priority::BackgroundExport` (Batch export jobs).
 
 ---
 
-## 3. Data Structures & Memory Layouts
+## 3. Imaging Pipeline & Colorimetric Formulation
 
-### 3.1 Develop Parameters (AST Model)
-Located in `crates/halation-core`. Must be strictly `Pod` (Plain Old Data) compatible for GPU uniform serialization:
+### 3.1 Color Transformation Chain
+Halation executes all tonal, contrast, and color-grading math inside a **Radiometrically Linear ProPhoto RGB** color space:
+
+```
+[Raw Camera Sensor Data] (CFA Bayer/X-Trans)
+       │
+       ▼ (libraw-sys demosaic + black/white point calibration)
+[Camera-Native Linear RGB]
+       │
+       ▼ (Camera Matrix * Bradford Chromatic Adaptation to D65)
+[Linear Camera-Neutral D65]
+       │
+       ▼ (ColorMatrix: Camera Neutral -> Linear ProPhoto RGB)
+[Working Space: Radiometrically Linear ProPhoto RGB]
+       │
+       ├── Exposure & Radiometric Scaling
+       ├── High-Dynamic-Range Tone Reconstruction (Log-Domain Highlights/Shadows)
+       ├── Radiometric Sigmoidal Contrast (Log-Domain around 18% Gray)
+       ├── Analytical Fritsch-Carlson Spline Tone Curve
+       ├── Color Grading, Vibrance & Saturation
+       │
+       ▼
+[Clamped Scene Radiance [0.0, 1.0]]
+       │
+       ▼ (3D Tetrahedral Display LUT via moxcms)
+[Display Monitor Profile] (sRGB / Display P3 / Rec.2020)
+```
+
+### 3.2 Chromatic Adaptation (Bradford D65 Formulation)
+Given source white balance parameters (Temperature $T$ in Kelvin, Tint $\Delta uv$), `halation-color` computes the chromatic adaptation matrix $\mathbf{M}_{\text{CAT}}$:
+
+$$\begin{bmatrix} X \\ Y \\ Z \end{bmatrix}_{\text{adapted}} = \mathbf{M}_{\text{Bradford}}^{-1} \begin{bmatrix} \rho_{\text{target}} / \rho_{\text{source}} & 0 & 0 \\ 0 & \gamma_{\text{target}} / \gamma_{\text{source}} & 0 \\ 0 & 0 & \beta_{\text{target}} / \beta_{\text{source}} \end{bmatrix} \mathbf{M}_{\text{Bradford}} \begin{bmatrix} X \\ Y \\ Z \end{bmatrix}_{\text{source}}$$
+
+Where the cone fundamentals transformation matrix is:
+$$\mathbf{M}_{\text{Bradford}} = \begin{bmatrix} 0.8951 & 0.2664 & -0.1614 \\ -0.7502 & 1.7135 & 0.0367 \\ 0.0389 & -0.0685 & 1.0296 \end{bmatrix}$$
+
+### 3.3 Log-Domain Tonal Reconstruction & Contrast Formulations
+
+#### 1. Exposure Scaling
+$$\mathbf{C}_{\text{exposed}} = \mathbf{C}_{\text{in}} \cdot 2^{\text{exposure}}$$
+
+#### 2. High-Dynamic-Range Highlights & Shadows
+Luminance is calculated using the ProPhoto RGB linear weights:
+$$L = \mathbf{C}_{\text{exposed}} \cdot \begin{bmatrix} 0.28804 \\ 0.71187 \\ 0.00009 \end{bmatrix}$$
+
+To prevent unnatural tonal inversions, highlights and shadows are evaluated in log-space:
+$$l_{\text{log}} = \log_2(L + 10^{-5})$$
+$$W_{\text{shadow}} = \text{clamp}\left(1.0 - \frac{l_{\text{log}} + 4.0}{4.0},\ 0.0,\ 1.0\right)$$
+$$W_{\text{highlight}} = \text{clamp}\left(\frac{l_{\text{log}} + 1.0}{4.0},\ 0.0,\ 1.0\right)$$
+$$\Delta L = (\text{shadows} \cdot 0.01 \cdot W_{\text{shadow}}) + (\text{highlights} \cdot 0.01 \cdot W_{\text{highlight}})$$
+$$\mathbf{C}_{\text{toned}} = \mathbf{C}_{\text{exposed}} \cdot 2^{\Delta L}$$
+
+#### 3. Radiometric Contrast (Sigmoidal Log-Domain)
+Contrast must pivot around the standardized $18\%$ neutral gray level without clipping negative values:
+$$\gamma = 1.0 + (\text{contrast} \cdot 0.005)$$
+$$\mathbf{C}_{\text{contrast}} = \left(\frac{\mathbf{C}_{\text{toned}}}{0.18}\right)^\gamma \cdot 0.18$$
+
+---
+
+## 4. GPU Shaders, Uniform Memory Layouts & Data Models
+
+### 4.1 Memory Layout Definitions (`halation-core`)
+WGSL `std140` and `std430` layout rules require strict 16-byte alignment boundaries. Matrices must have 16-byte aligned column vectors.
 
 ```rust
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable, serde::Serialize, serde::Deserialize)]
+// crates/halation-core/src/uniforms.rs
+use bytemuck::{Pod, Zeroable};
+
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable, serde::Serialize, serde::Deserialize)]
 pub struct GpuDevelopUniforms {
-    pub exposure: f32,       // -5.0 to +5.0 EV
-    pub contrast: f32,       // -100.0 to +100.0
-    pub highlights: f32,     // -100.0 to +100.0
-    pub shadows: f32,        // -100.0 to +100.0
-    pub whites: f32,         // -100.0 to +100.0
-    pub blacks: f32,         // -100.0 to +100.0
-    pub temperature: f32,    // 2000.0 to 50000.0 K
-    pub tint: f32,           // -150.0 to +150.0
-    pub vibrance: f32,       // -100.0 to +100.0
-    pub saturation: f32,     // -100.0 to +100.0
-    pub _padding: [f32; 2],  // Aligns to 16-byte boundary for WGSL std140
+    pub exposure: f32,       // Offset 0
+    pub contrast: f32,       // Offset 4
+    pub highlights: f32,     // Offset 8
+    pub shadows: f32,        // Offset 12
+    pub whites: f32,         // Offset 16
+    pub blacks: f32,         // Offset 20
+    pub temperature: f32,    // Offset 24
+    pub tint: f32,           // Offset 28
+    pub vibrance: f32,       // Offset 32
+    pub saturation: f32,     // Offset 36
+    pub num_spline_segments: u32, // Offset 40 (Count of valid spline cubic segments)
+    pub _padding: f32,       // Offset 44 -> Aligns to 48 bytes (multiple of 16)
+}
+
+/// Represents a single cubic spline segment: f(x) = a*x^3 + b*x^2 + c*x + d
+/// Valid on domain [x_min, x_max].
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable, serde::Serialize, serde::Deserialize)]
+pub struct SplineSegment {
+    pub coeffs: [f32; 4],    // a, b, c, d (16 bytes)
+    pub domain: [f32; 2],    // x_min, x_max (8 bytes)
+    pub _pad: [f32; 2],      // 8 bytes padding -> 32 bytes total per segment
+}
+
+/// Padded 3x3 matrix for WGSL uniform buffers where each column occupies 16 bytes.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct GpuMat3x3 {
+    pub col0: [f32; 4],      // r, g, b, 0.0
+    pub col1: [f32; 4],      // r, g, b, 0.0
+    pub col2: [f32; 4],      // r, g, b, 0.0
 }
 ```
 
-### 3.2 Spline Tone Curve Representation
-```rust
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SplineCurve {
-    /// Ordered control points in normalized Cartesian coordinates [0.0, 1.0]
-    pub points: Vec<glam::Vec2>,
-}
+### 4.2 Production WGSL Shader (`assets/shaders/develop_pipeline.wgsl`)
 
-impl SplineCurve {
-    /// Evaluates the curve at luminance input x using Monotone Cubic Spline (Fritsch-Carlson)
-    pub fn evaluate(&self, x: f32) -> f32;
-    /// Generates a 256-entry 1D lookup table for GPU upload
-    pub fn generate_lut_256(&self) -> [f32; 256];
-}
-```
-
-### 3.3 Tile Pyramid & Cache Key
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TileCoord {
-    pub asset_id: u64,
-    pub level: u8,   // 0 = 100% full-res, 1 = 50%, 2 = 25%, 3 = 12.5%
-    pub x: u32,      // Tile coordinate x (512px stride)
-    pub y: u32,      // Tile coordinate y (512px stride)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheKey {
-    pub coord: TileCoord,
-    pub params_hash: [u8; 32], // blake3 hash of active DevelopParameters
-}
-```
-
----
-
-## 4. Internal API Trait Definitions
-
-To ensure strict module decoupling, crates interact exclusively through traits:
-
-### 4.1 Image Pipeline Engine (`halation-pipeline`)
-```rust
-pub trait ImagePipelineEngine: Send + Sync {
-    /// Dispatches an immediate preview render for the viewport at current display resolution
-    fn render_viewport_preview(
-        &self,
-        asset: &RawAsset,
-        params: &DevelopParameters,
-        target_size: (u32, u32),
-    ) -> Result<ViewportFrame, PipelineError>;
-
-    /// Requests a specific high-resolution 1:1 tile from the compute queue
-    fn request_tile(
-        &self,
-        coord: TileCoord,
-        params: &DevelopParameters,
-    ) -> Result<wgpu::TextureView, PipelineError>;
-
-    /// Calculates a 256-bin RGB + Luminance histogram
-    fn compute_histogram(
-        &self,
-        frame: &ViewportFrame,
-    ) -> HistogramData;
-}
-```
-
-### 4.2 Color Engine (`halation-color`)
-```rust
-pub trait ColorManagementEngine: Send + Sync {
-    /// Queries the OS for the active display's ICC profile (Win32 GDI / AppKit)
-    fn get_active_display_profile(&self) -> Result<DisplayProfile, ColorError>;
-
-    /// Builds a 3D tetrahedral RGB LUT converting ProPhoto RGB linear into target display space
-    fn build_display_lut(
-        &self,
-        source_profile: &DisplayProfile,
-        target_profile: &DisplayProfile,
-        lut_size: u32, // Standard: 33x33x33 or 65x65x65
-    ) -> Result<Vec<f32>, ColorError>;
-
-    /// Generates chromatic adaptation matrix (Bradford) for White Balance shift
-    fn calculate_white_balance_matrix(
-        &self,
-        temp_kelvin: f32,
-        tint: f32,
-    ) -> glam::Mat3;
-}
-```
-
-### 4.3 Catalog Repository (`halation-catalog`)
-```rust
-pub trait CatalogRepository: Send + Sync {
-    fn import_asset(&self, path: &std::path::Path) -> Result<u64, CatalogError>;
-    fn query_assets(&self, filter: &CatalogFilter) -> Result<Vec<CatalogItem>, CatalogError>;
-    fn update_rating(&self, asset_id: u64, rating: u8) -> Result<(), CatalogError>;
-    fn update_flag(&self, asset_id: u64, flag: FlagState) -> Result<(), CatalogError>;
-    fn commit_develop_state(&self, asset_id: u64, params: &DevelopParameters) -> Result<(), CatalogError>;
-    fn get_undo_history(&self, asset_id: u64) -> Result<Vec<HistoryNode>, CatalogError>;
-}
-```
-
----
-
-## 5. GPU Shaders & Pipeline Layouts (`halation-gpu`)
-
-### 5.1 Pipeline Bind Groups
-The core Develop compute pipeline uses two primary bind groups to separate static assets from high-frequency parameters:
-
-* **Bind Group 0 (Static Scene):**
-  * Binding 0: `input_texture` (`texture_2d<f32>`, linear sensor data or source tile).
-  * Binding 1: `linear_sampler` (`sampler`).
-  * Binding 2: `display_lut_3d` (`texture_3d<f32>`, 33x33x33 tetrahedral monitor color transform).
-* **Bind Group 1 (Dynamic Parameters - Updated per slider drag):**
-  * Binding 0: `uniforms` (`buffer<uniform>, GpuDevelopUniforms`).
-  * Binding 1: `tone_curve_lut` (`texture_1d<f32>`, 256-entry R32Float).
-  * Binding 2: `output_surface` (`texture_storage_2d<rgba16float, write>`).
-
-### 5.2 Compute Shader Specification (`assets/shaders/develop_pipeline.wgsl`)
 ```wgsl
 struct DevelopUniforms {
     exposure: f32,
@@ -210,16 +248,54 @@ struct DevelopUniforms {
     tint: f32,
     vibrance: f32,
     saturation: f32,
-    _padding: vec2<f32>,
+    num_spline_segments: u32,
+    _pad: f32,
 };
+
+struct SplineSegment {
+    coeffs: vec4<f32>, // a, b, c, d
+    domain: vec2<f32>, // x_min, x_max
+    _pad: vec2<f32>,
+};
+
+struct WhiteBalanceMatrix {
+    col0: vec4<f32>,
+    col1: vec4<f32>,
+    col2: vec4<f32>,
+};
+
+// ProPhoto RGB Linear Luminance Weights
+const PROPHOTO_LUMA: vec3<f32> = vec3<f32>(0.28804, 0.71187, 0.00009);
 
 @group(0) @binding(0) var input_tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var display_lut_3d: texture_3d<f32>;
 
 @group(1) @binding(0) var<uniform> u: DevelopUniforms;
-@group(1) @binding(1) var curve_lut: texture_1d<f32>;
-@group(1) @binding(2) var output_tex: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var<uniform> wb: WhiteBalanceMatrix;
+@group(1) @binding(2) var<storage, read> spline_segments: array<SplineSegment>;
+@group(1) @binding(3) var output_tex: texture_storage_2d<rgba16float, write>;
+
+fn evaluate_spline(val: f32) -> f32 {
+    let num_segs = u.num_spline_segments;
+    if (num_segs == 0u) {
+        return val;
+    }
+    
+    // Clamp evaluation to domain of defined splines
+    let clamped_val = clamp(val, 0.0, 1.0);
+    for (var i = 0u; i < num_segs; i = i + 1u) {
+        let seg = spline_segments[i];
+        if (clamped_val >= seg.domain.x && clamped_val <= seg.domain.y) {
+            let x = clamped_val - seg.domain.x;
+            return seg.coeffs.x * x * x * x +
+                   seg.coeffs.y * x * x +
+                   seg.coeffs.z * x +
+                   seg.coeffs.w;
+        }
+    }
+    return val;
+}
 
 @compute @workgroup_size(16, 16)
 fn cs_develop_main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -230,25 +306,50 @@ fn cs_develop_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let coord = vec2<i32>(id.xy);
     var color = textureLoad(input_tex, coord, 0).rgb;
 
-    // 1. Exposure Compensation (Stops)
-    color = color * pow(2.0, u.exposure);
+    // 1. Chromatic Adaptation / White Balance (Bradford Transform in LMS Space)
+    let wb_mat = mat3x3<f32>(wb.col0.xyz, wb.col1.xyz, wb.col2.xyz);
+    color = wb_mat * color;
 
-    // 2. Highlights & Shadows Decomposition
-    let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let shadow_mask = pow(1.0 - clamp(luma / 0.35, 0.0, 1.0), 2.0);
-    let highlight_mask = pow(clamp((luma - 0.65) / 0.35, 0.0, 1.0), 2.0);
-    color += color * ((u.shadows * 0.005 * shadow_mask) + (u.highlights * 0.005 * highlight_mask));
+    // 2. Linear Exposure Energy Scaling
+    color = color * exp2(u.exposure);
 
-    // 3. Contrast (S-Curve about 18% neutral gray)
-    let c_factor = (259.0 * (u.contrast + 255.0)) / (255.0 * (259.0 - u.contrast));
-    color = (color - 0.18) * c_factor + 0.18;
+    // 3. High-Dynamic-Range Highlights & Shadows in Log Space
+    let luma = dot(color, PROPHOTO_LUMA);
+    if (luma > 0.00001) {
+        let log_luma = log2(luma);
+        let shadow_weight = clamp(1.0 - (log_luma + 4.0) / 4.0, 0.0, 1.0);
+        let highlight_weight = clamp((log_luma + 1.0) / 4.0, 0.0, 1.0);
+        
+        let luma_delta = (u.shadows * 0.01 * shadow_weight) + (u.highlights * 0.01 * highlight_weight);
+        color = color * exp2(luma_delta);
+    }
 
-    // 4. Tone Curve Sampling (1D Texture LUT)
-    color.r = textureSampleLevel(curve_lut, samp, color.r, 0.0).r;
-    color.g = textureSampleLevel(curve_lut, samp, color.g, 0.0).r;
-    color.b = textureSampleLevel(curve_lut, samp, color.b, 0.0).r;
+    // 4. Whites & Blacks Linear Expansion
+    let white_scale = 1.0 + (u.whites * 0.005);
+    let black_offset = u.blacks * 0.002;
+    color = max((color * white_scale) + vec3<f32>(black_offset), vec3<f32>(0.0));
 
-    // 5. Display Gamut Mapping (3D Tetrahedral LUT)
+    // 5. Radiometric Sigmoidal Contrast (pivoting around 18% gray)
+    let contrast_gamma = 1.0 + (u.contrast * 0.005);
+    color = pow(max(color, vec3<f32>(0.0)) / 0.18, vec3<f32>(contrast_gamma)) * 0.18;
+
+    // 6. Analytical Tone Curve Evaluation (Per-Channel)
+    color.r = evaluate_spline(color.r);
+    color.g = evaluate_spline(color.g);
+    color.b = evaluate_spline(color.b);
+
+    // 7. Vibrance and Saturation
+    let post_luma = dot(color, PROPHOTO_LUMA);
+    let max_c = max(color.r, max(color.g, color.b));
+    let min_c = min(color.r, min(color.g, color.b));
+    let current_sat = (max_c - min_c) / (max_c + 0.0001);
+    
+    let vib_mult = 1.0 + (u.vibrance * 0.01 * (1.0 - current_sat));
+    let sat_mult = 1.0 + (u.saturation * 0.01);
+    color = post_luma + (color - post_luma) * (vib_mult * sat_mult);
+
+    // 8. Display Gamut Mapping & Output OETF via 3D Tetrahedral Display LUT
+    // Clamping to [0.0, 1.0] prepares normalized coordinates for the 33x33x33 texture LUT
     let display_color = textureSampleLevel(display_lut_3d, samp, clamp(color, vec3(0.0), vec3(1.0)), 0.0).rgb;
 
     textureStore(output_tex, coord, vec4<f32>(display_color, 1.0));
@@ -257,76 +358,262 @@ fn cs_develop_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 ---
 
-## 6. SQLite Catalog Schema Specification
+## 5. Catalog Persistence, Volume Resolution & History DAG
 
-The catalog uses write-ahead logging (WAL) mode for concurrent read/write transactions:
+### 5.1 Cross-Platform Volume UUID Resolution
+To survive drive letter reassignments (Windows) and fluctuating mount paths (macOS/Linux), Halation generates a canonical, persistent volume identity:
 
-```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
+```rust
+// crates/halation-catalog/src/volume.rs
+use std::path::Path;
 
--- 1. Ingested Photo Assets
-CREATE TABLE IF NOT EXISTS assets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path TEXT NOT NULL UNIQUE,
-    volume_serial TEXT NOT NULL,
-    file_hash BLOB NOT NULL, -- 32-byte BLAKE3 checksum
-    file_size INTEGER NOT NULL,
-    capture_time INTEGER,    -- Unix epoch (UTC)
-    camera_make TEXT,
-    camera_model TEXT,
-    lens_model TEXT,
-    focal_length REAL,
-    aperture REAL,
-    shutter_speed TEXT,
-    iso INTEGER,
-    rating INTEGER NOT NULL DEFAULT 0 CHECK (rating BETWEEN 0 AND 5),
-    flag TEXT NOT NULL DEFAULT 'None' CHECK (flag IN ('Pick', 'Reject', 'None')),
-    color_label TEXT NOT NULL DEFAULT 'None' CHECK (color_label IN ('Red', 'Yellow', 'Green', 'Blue', 'Purple', 'None')),
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-);
+pub struct VolumeResolver;
 
-CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(file_hash);
-CREATE INDEX IF NOT EXISTS idx_assets_rating ON assets(rating);
-CREATE INDEX IF NOT EXISTS idx_assets_flag ON assets(flag);
+impl VolumeResolver {
+    #[cfg(target_os = "windows")]
+    pub fn get_volume_uuid(path: &Path) -> Result<String, std::io::Error> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
 
--- 2. Non-Destructive Parameter States (Current Active State)
-CREATE TABLE IF NOT EXISTS develop_states (
-    asset_id INTEGER PRIMARY KEY,
-    params_json TEXT NOT NULL, -- Canonical JSON matching DevelopParameters
-    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE
-);
+        let root = path.components().next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Missing volume root")
+        })?;
+        let root_str: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
 
--- 3. Undo/Redo Directed Acyclic Graph (DAG) & Snapshots
-CREATE TABLE IF NOT EXISTS develop_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id INTEGER NOT NULL,
-    parent_history_id INTEGER,
-    action_label TEXT NOT NULL, -- e.g., "Change Exposure", "Apply Preset: Moody"
-    params_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    FOREIGN KEY(asset_id) REFERENCES assets(id) ON DELETE CASCADE,
-    FOREIGN KEY(parent_history_id) REFERENCES develop_history(id) ON DELETE SET NULL
-);
+        let mut serial_number: u32 = 0;
+        unsafe {
+            GetVolumeInformationW(
+                windows::core::PCWSTR(root_str.as_ptr()),
+                None,
+                Some(&mut serial_number),
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(format!("WIN-{:08X}", serial_number))
+    }
 
-CREATE INDEX IF NOT EXISTS idx_history_asset ON develop_history(asset_id);
+    #[cfg(target_os = "macos")]
+    pub fn get_volume_uuid(path: &Path) -> Result<String, std::io::Error> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes())?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+        if res != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // stat.f_fsid encodes the unique OS filesystem ID
+        Ok(format!("MAC-{:08X}{:08X}", stat.f_fsid.val[0], stat.f_fsid.val[1]))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_volume_uuid(path: &Path) -> Result<String, std::io::Error> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes())?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+        if res != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(format!("LNX-{:08X}{:08X}", stat.f_fsid.__val[0], stat.f_fsid.__val[1]))
+    }
+}
+```
+
+### 5.2 Branching History DAG Traversal Engine
+
+```
+       [Node 1: Import Baseline]
+                   │
+                   ▼
+       [Node 2: Exposure +0.50]
+                   │
+         ┌─────────┴─────────┐ (Undo 1 step + modify)
+         ▼                   ▼
+[Node 3: Contrast +20]   [Node 4: Temp 6500K] (Active Head)
+         │
+         ▼
+[Node 5: B&W Conversion]
+```
+
+When an edit is applied from an arbitrary historical state:
+1. Halation evaluates `parent_history_id = develop_states.active_history_id`.
+2. Inserts a new node into `develop_history`.
+3. Points `develop_states.active_history_id` directly to the newly inserted node.
+4. Old branch nodes (`Node 3`, `Node 5`) remain persisted and reachable in the History Panel UI without truncation.
+
+```rust
+// crates/halation-catalog/src/history.rs
+use rusqlite::{params, Connection, Result};
+
+pub fn commit_history_step(
+    conn: &mut Connection,
+    asset_id: u64,
+    action_label: &str,
+    new_params_json: &str,
+) -> Result<u64> {
+    let tx = conn.transaction()?;
+
+    // 1. Fetch current active history head
+    let active_head_id: Option<i64> = tx.query_row(
+        "SELECT active_history_id FROM develop_states WHERE asset_id = ?1",
+        params![asset_id],
+        |row| row.get(0),
+    ).ok();
+
+    // 2. Insert new DAG node referencing active head as parent
+    tx.execute(
+        "INSERT INTO develop_history (asset_id, parent_history_id, action_label, params_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![asset_id, active_head_id, action_label, new_params_json],
+    )?;
+    let new_node_id = tx.last_insert_rowid() as u64;
+
+    // 3. Update the active develop state pointer
+    tx.execute(
+        "INSERT INTO develop_states (asset_id, active_history_id, params_json, updated_at)
+         VALUES (?1, ?2, ?3, strftime('%s', 'now'))
+         ON CONFLICT(asset_id) DO UPDATE SET
+             active_history_id = excluded.active_history_id,
+             params_json = excluded.params_json,
+             updated_at = excluded.updated_at",
+        params![asset_id, new_node_id, new_params_json],
+    )?;
+
+    tx.commit()?;
+    Ok(new_node_id)
+}
 ```
 
 ---
 
-## 7. State Synchronization & Undo/Redo DAG
+## 6. Local Machine Learning Inference Pipeline (`halation-ml`)
 
-To prevent slider interactions from spamming thousands of redundant undo nodes:
+Halation implements a **two-phase decoupled neural vision architecture** via `ort` (ONNX Runtime) with native hardware acceleration (DirectML on Windows, CoreML on macOS, Vulkan on Linux):
 
-1. **Continuous Scrubbing (Transient State):**
-   * Dragging a slider dispatches `Message::ParamExposure(val)`.
-   * The UI updates synchronously; frames are rendered at 120 FPS.
-   * **No undo record is created during active dragging.**
-2. **Coalesced Commit (Persistent State):**
-   * On mouse-button release (`Event::Mouse(mouse::Event::ButtonReleased)`), a debounced commit fires.
-   * Halation hashes the new `DevelopParameters` struct via `blake3`.
-   * If the hash differs from the parent state, a new node is appended to the `develop_history` table in SQLite.
-3. **Branching History DAG:**
-   * Undoing 5 steps and moving a new slider creates a branch node rather than overwriting history, preserving every user edit across sessions.
+```
+[Loupe Viewport Selection]
+           │
+           ▼ (Trigger Background Task via Tokio)
+┌────────────────────────────────────────────────────────┐
+│ Phase 1: Background Embedding Worker                   │
+│ • Model: MobileSAM Image Encoder (Quantized INT8)      │
+│ • Input: 1024x1024 RGB Preprocessed Tensor             │
+│ • Execution Time: ~300ms (dGPU) / ~1200ms (Iris Xe)   │
+│ • Output: Image Embedding Tensor [1, 256, 64, 64]       │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+                           ▼ (Stored in Memory Cache)
+┌────────────────────────────────────────────────────────┐
+│ Phase 2: Interactive Prompt Decoder                    │
+│ • User Action: Clicks "Select Subject" or "Select Sky" │
+│ • Model: Lightweight Mask Decoder (FP16)               │
+│ • Execution Time: < 15ms                               │
+│ • Output: 8-bit Alpha Mask (1024x1024)                 │
+└──────────────────────────┬─────────────────────────────┘
+                           │
+                           ▼
+[Uploaded to GPU as wgpu::TextureView -> Injected into Mask Pipeline]
+```
+
+### 6.1 ONNX Pipeline Manager Implementation
+```rust
+// crates/halation-ml/src/engine.rs
+use ort::{session::Session, value::Tensor};
+use std::sync::Arc;
+
+pub struct VisionEngine {
+    encoder_session: Arc<Session>,
+    decoder_session: Arc<Session>,
+}
+
+impl VisionEngine {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let env = ort::init()
+            .with_name("HalationVision")
+            .commit()?;
+
+        #[cfg(target_os = "windows")]
+        let execution_provider = ort::execution_providers::DirectMLExecutionProvider::default().build();
+        #[cfg(target_os = "macos")]
+        let execution_provider = ort::execution_providers::CoreMLExecutionProvider::default().build();
+        #[cfg(target_os = "linux")]
+        let execution_provider = ort::execution_providers::CPUExecutionProvider::default().build();
+
+        let encoder_session = Session::builder()?
+            .with_execution_providers([execution_provider.clone()])?
+            .with_optimization_level(ort::session::GraphOptimizationLevel::Level3)?
+            .commit_from_file("assets/models/mobilesam_encoder_quant.onnx")?;
+
+        let decoder_session = Session::builder()?
+            .with_execution_providers([execution_provider])?
+            .commit_from_file("assets/models/mobilesam_decoder.onnx")?;
+
+        Ok(Self {
+            encoder_session: Arc::new(encoder_session),
+            decoder_session: Arc::new(decoder_session),
+        })
+    }
+
+    /// Evaluates prompt points against the precomputed embedding in < 15ms
+    pub fn decode_mask(
+        &self,
+        image_embeddings: &Tensor<f32>,
+        point_coords: &[f32], // Normalized [N, 2]
+        point_labels: &[f32], // 1.0 = foreground, 0.0 = background
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Run decoder session and extract single-channel 8-bit precision mask
+        // ... (tensor bind, session.run(), return mask bytes)
+        Ok(vec![])
+    }
+}
+```
+
+---
+
+## 7. Tile Pyramid Engine & Memory Budgeting (`halation-pipeline`)
+
+To support instantaneous pan and 1:1 pixel inspection on 45–100 MP images without out-of-memory (OOM) crashes, Halation uses a **tiled multiresolution image pyramid**:
+
+```
+Level 0: 100% Native Resolution (512x512 Tiled Grid) ─── Highest VRAM footprint, loaded on demand
+Level 1: 50% Stride (Downsampled 2x2)
+Level 2: 25% Stride (Downsampled 4x4)
+Level 3: Fit Preview (Max Dimension: 2048px) ────────── Persistently pinned in GPU VRAM
+```
+
+### 7.1 Dynamic Memory Budget Caps
+- **VRAM Hard Ceiling:** Halation clamps its active GPU texture allocations to **$50\%$ of detected dedicated VRAM** (e.g., $4\text{ GB}$ ceiling on an $8\text{ GB}$ RTX 3060).
+- **Host RAM LRU Tile Cache:** 
+  - Maintains $1024$ uncompressed 16-bit half-float tiles ($512 \times 512 \times 8\text{ bytes} \approx 2\text{ MB}$ per tile $\to 2.0\text{ GB}$ total RAM budget).
+  - Background eviction uses a thread-safe `lru::LruCache` keyed by `TileCoord`.
+
+---
+
+## 8. Verification, Testing & Air-Gap Compliance Checklist
+
+### 8.1 Automated Air-Gap Test Suite
+An automated integration test verifies that Halation never initiates network socket connections:
+
+```rust
+// tests/airgap_compliance.rs
+#[test]
+fn verify_zero_network_sockets_opened() {
+    // 1. Hook OS socket syscalls (socket, connect, sendto) via LD_PRELOAD / Detours
+    // 2. Initialize Halation catalog, import RAW files, run AI segmentation, batch export
+    // 3. Assert socket call counter == 0
+}
+```
+
+### 8.2 Colorimetric Numerical Tolerance Tests
+- Linear ProPhoto Bradford calculations **must** match reference double-precision calculations within a tolerance of $\Delta E_{00} < 0.05$.
+- Tone curve monotonicity: For any monotonically increasing control points $y_i \le y_{i+1}$, the first derivative of the spline **must** satisfy $f'(x) \ge 0$ across all $x \in [0.0, 1.0]$.
+
+### 8.3 Sidecar Round-Trip Invariance
+- Writing a parameter state to `.xmp` and immediately parsing it back into `DevelopParameters` **must** produce identical bitwise hashes (`blake3`) with zero floating-point drift:
+  $$\text{assert\_eq!}(\text{hash}(\mathbf{P}_{\text{initial}}),\ \text{hash}(\text{deserialize}(\text{serialize}(\mathbf{P}_{\text{initial}}))))$$

@@ -4,7 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-halation-core = { workspace = true }
-glam = { workspace = true }
 moxcms = { workspace = true }
-thiserror = { workspace = true }
+windows = { workspace = true, features = ["Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging"] }

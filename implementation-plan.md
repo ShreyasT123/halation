@@ -1,266 +1,355 @@
-Here is the comprehensive, production-grade **`IMPLEMENTATION_PLAN.md`** for Halation. It translates our architectural design into phased engineering milestones, detailing the exact crate tasks, technical deliverables, and verification criteria for each phase.
+# Halation: Final Engineering Implementation Plan & UI Design System
+**Document Version:** 2.0.0 (Corrected Canonical Roadmap)  
+**Status:** Approved for Execution  
+**Execution Horizon:** Sprints 1 through 8  
+**Architecture:** 100% Standalone Offline Desktop (Windows 10/11, macOS 14+, Linux x86_64)
 
 ---
 
-# Halation: Engineering Implementation Plan & Roadmap
-**Document Version:** 1.0.0  
-**Status:** Canonical Implementation Roadmap  
-**Target Milestone Schedule:** Sprints 1 through 8  
-**Baseline Workspace:** Rust 2021 Workspace (`apps/halation-desktop`, `crates/halation-*`)
+## 0. UI/UX Visual Architecture & Design System
 
----
-
-## Roadmap Overview
+To replace crude prototypes with a high-density, professional darkroom interface, Halation blends the **tactile depth of Lightroom Classic** (persistent Navigator mini-map, collapsible History DAG with delta labels, 5-zone histogram, and live EXIF HUD) with the **restrained, modern ergonomics of modern Lightroom Desktop** (vertical tool rails, high-contrast monospace readouts, fluid scrubby sliders with dynamic gradient tracks, and borderless canvas framing).
 
 ```
-Sprint 1: Foundation Hardening & Real Image Ingestion
-    │
-    ▼
-Sprint 2: GPU Compute Migration (WGSL Engine & Viewport Blit)
-    │
-    ▼
-Sprint 3: Viewport Navigation (Pan, Zoom, 1:1 Peeping, Split Before/After)
-    │
-    ▼
-Sprint 4: Specialized Control Widgets (Scrubby Sliders, Spline Curve, Color Wheels)
-    │
-    ▼
-Sprint 5: Deep Color Engine & Display Gamut Mapping (MoxCMS & 3D LUTs)
-    │
-    ▼
-Sprint 6: Catalog Scaling & Digital Asset Management (100k Virtualized Grid)
-    │
-    ▼
-Sprint 7: Non-Destructive History DAG & XMP Sidecar Sync
-    │
-    ▼
-Sprint 8: Batch Export Pipeline & AI/Neural Acceleration (DirectML / SAM)
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ WINDOW TITLEBAR & APPLICATION MENU (File, Edit, Photo, View, Window, Help)                             │
+├─────────┬───────────────────────────────────────────────────────────────┬──────────────────────────────┤
+│ LEFT    │ CENTER VIEWPORT (The Loupe Canvas)                            │ RIGHT EDIT & TOOL RAIL       │
+│ PANEL   │                                                               │                              │
+│ (260px) │ ┌───────────────────────────────────────────────────────────┐ │ ┌──────────────────────────┐ │
+│         │ │                                                           │ │ │ HISTOGRAM & EXIF HUD     │ │
+│ • Nav   │ │                                                           │ │ │ [RGB Waveform + Metadata]│ │
+│   Mini- │ │                                                           │ │ ├──────────────────────────┤ │
+│   map   │ │                                                           │ │ │ TOOL STRIP (H, C, B, M)  │ │
+│ • Snap- │ │                  IMAGE CANVAS                             │ │ ├──────────────────────────┤ │
+│   shots │ │               (32-bit Float WGPU)                         │ │ │ ACCORDION PANELS:        │ │
+│ • Histo-│ │                                                           │ │ │ • Basic / Light          │ │
+│   ry    │ │                                                           │ │ │ • Color (HSL, Wheels)    │ │
+│   DAG   │ │                                                           │ │ │ • Tone Curve (Spline)    │ │
+│ • Local │ └───────────────────────────────────────────────────────────┘ │ │ • Detail (Sharpen/NR)    │ │
+│   Tree  │ ┌───────────────────────────────────────────────────────────┐ │ │ • Optics & Geometry     │ │
+│         │ │ VIEWPORT TOOLBAR (Fit, 1:1, Before/After Split, Zoom)     │ │ └──────────────────────────┘ │
+├─────────┴─┴───────────────────────────────────────────────────────────┴─┴──────────────────────────────┤
+│ BOTTOM FILMSTRIP DRAWER (110px)                                                                        │
+│ [Rating ★★★☆☆] [Pick/Reject] [Thumb 1] [Thumb 2] [Active Thumb] [Thumb 4] ... [Counter: 1/542 RAWs]     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 0.1 Design Tokens & Surface Palette
+
+*   **Window & Matte Neutral:**
+    *   Application Shell Background: `#121212` (Ultra-deep neutral gray)
+    *   Panel Surfaces (Left / Right): `#181818` (Dark charcoal)
+    *   Section Headers & Accordion Cards: `#202020`
+    *   Recessed Slider Tracks & Input Fields: `#282828`
+    *   Canvas Viewport Matte: `#161616` (Neutral gray to prevent visual white-point drift)
+*   **Dividers, Borders & Radii:**
+    *   Subtle Panel Dividers: 1px solid `#2c2c2c`
+    *   Component Corner Radii: Strict **3px to 4px** desktop standard (no rounded mobile cards)
+*   **Semantic Accents & Indicators:**
+    *   Interactive Accent / Selection Ring: Sky Blue `#2680eb`
+    *   Pick Flag: Vibrant Emerald `#46a758`
+    *   Reject Flag: Crimson `#e5484d`
+    *   Shadow Clipping Overlay: Pure Blue `#2255ff` (Canvas HUD `J`)
+    *   Highlight Clipping Overlay: Pure Red `#ff2222` (Canvas HUD `J`)
+*   **Typography Hierarchy:**
+    *   Interface Labels: `Inter`, `SF Pro Display`, or `Segoe UI Variable` (11px, Medium, `#a0a0a0`)
+    *   Section Headings: 12px, Semi-Bold, `#d4d4d4`
+    *   Numeric Slider Values: `JetBrains Mono` or `SF Mono` (11px, Regular, `#e0e0e0`) — **fixed-width tabular numbers prevent layout jitter during scrubbing.**
 
 ---
 
-## Sprint 1: Foundation Hardening & Real Asset Ingestion
+## Sprint 1: System Foundation, Native Ingestion & Professional Shell
 
-**Primary Objective:** Transition from procedural/synthetic test patterns to importing and decoding real photographic assets (RAW, DNG, TIFF, JPEG) from the local filesystem on Windows.
+**Primary Objective:** Replace crude placeholder boxes with the production tripartite darkroom shell; ingest real RAW/DNG files from disk via native dialogs; decode sensor data using LibRaw FFI.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SPRINT 1 ARCHITECTURE FLOW                                                   │
+│ [Native File Dialog] ──► [libraw-sys FFI] ──► [Linear Float Texture Engine]  │
+│                                           └──► [kamadak-exif HUD Display]    │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 1.1 Tasks & Deliverables
 
-* [ ] **Fix Windows Fallback Glyph Artifacts (`halation-ui`):**
-  * Replace the Unicode star codepoints (`★`) that failed to render on Windows with clean ASCII or bundled SVG star icons using `iced::widget::svg`.
-* [ ] **Integrate Native File Dialog (`halation-ui` + `rfd`):**
-  * Implement an **"Import Photos..."** action in the top bar.
-  * Wire `rfd::FileDialog::new()` with file extension filters: `*.arw`, `*.cr2`, `*.cr3`, `*.nef`, `*.dng`, `*.tif`, `*.tiff`, `*.jpg`, `*.jpeg`.
-* [ ] **RAW & Metadata Ingestion Engine (`halation-raw`):**
-  * Integrate `kamadak-exif` to extract full EXIF blocks: Camera Make/Model, Lens Model, Focal Length, Exposure Time, F-Number, ISO, Capture Timestamp, and White Balance tags.
-  * Implement a pure-Rust DNG / TIFF / JPEG decoding path using `image` and `zune-image`.
-  * Define `RawDecoder` trait with a fallback strategy (pure-Rust decoders for uncompressed DNG/TIFF/JPEG; initial LibRaw FFI wrapper stubbed behind a `native-raw` feature flag).
-* [ ] **Catalog Indexing on Ingest (`halation-catalog`):**
-  * Compute 32-byte `blake3` file hashes upon file selection.
-  * Query Windows volume serial numbers via Win32 `GetVolumeInformationW`.
-  * Insert ingested records into SQLite `assets` table within a single transactional batch (`conn.transaction()`).
+*   [ ] **Tripartite Darkroom Window Shell (`halation-ui`):**
+    *   Build the persistent desktop layout:
+        *   Left Sidebar ($260\text{ px}$ fixed width, collapsible via `Tab`).
+        *   Right Edit Inspector ($320\text{ px}$ fixed width, collapsible via `Shift+Tab`).
+        *   Center Viewport with flexible layout sizing.
+        *   Bottom Filmstrip ($110\text{ px}$ fixed height, collapsible via `/`).
+    *   Implement sleek 1px panel borders (`#2c2c2c`) and collapse buttons with smooth transition state.
+*   [ ] **Native File Dialog & Volume Discovery (`halation-ui` + `rfd`):**
+    *   Add native Windows/macOS/Linux Open Folder and Open File actions (`Ctrl/Cmd+O`, `Ctrl/Cmd+Shift+I`).
+    *   Filter for extensions: `.arw`, `.cr2`, `.cr3`, `.nef`, `.dng`, `.tif`, `.tiff`, `.jpg`, `.jpeg`.
+    *   Compute volume UUIDs using platform hooks (`GetVolumeInformationW` on Windows, `statfs.f_fsid` on POSIX).
+*   [ ] **RAW Decoding Pipeline Integration (`halation-raw`):**
+    *   Bind `libraw-sys` (LibRaw 0.21+) as the baseline camera RAW demosaicing engine for proprietary CFA patterns.
+    *   Extract unclipped 32-bit floating-point linear sensor pixels, active sensor area crop bounds, and camera matrix tags.
+    *   Fallback pure-Rust decoding path via `image` and `zune-image` for uncompressed DNGs, TIFFs, and JPEGs.
+*   [ ] **Live EXIF HUD Component (`halation-ui`):**
+    *   Extract EXIF blocks via `kamadak-exif`: Camera Make/Model, Lens, Focal Length, Exposure Time, F-Number, ISO, and Capture Date.
+    *   Render a high-density, professional HUD bar below the histogram:
+        $$\text{\texttt{ISO 200 \textbar\ 50mm \textbar\ f/2.8 \textbar\ 1/500s \textbar\ Sony A7 IV}}$$
+*   [ ] **SQLite WAL Storage Initialization (`halation-catalog`):**
+    *   Initialize SQLite database with `PRAGMA journal_mode = WAL;` and `PRAGMA synchronous = NORMAL;`.
+    *   Enforce schema: `assets (volume_uuid, relative_path, file_hash, EXIF)` with composite indices.
 
 ### 1.2 Definition of Done (DoD)
-* User clicks "Import", selects an actual `.DNG` or `.JPEG` from their Windows drive, and the image renders in the center viewport.
-* The EXIF HUD below the canvas displays the camera, lens, ISO, shutter, and aperture extracted from the actual file.
-* Relaunching the application shows the imported file persisted in the SQLite catalog.
+* Halation launches into a dark-themed (`#121212`), professional 3-panel shell.
+* User clicks "Import", chooses a Sony `.ARW` or Nikon `.NEF` from an external drive, and the raw image renders directly in the center loupe.
+* EXIF HUD populates with camera, lens, and exposure data.
+* Relaunching the application shows the image cataloged in the SQLite database.
 
 ---
 
-## Sprint 2: GPU Compute Pipeline Migration
+## Sprint 2: GPU Compute Pipeline & Shared Surface Presentation
 
-**Primary Objective:** Move the pixel-processing pipeline off the CPU Rayon thread pool and onto the GPU using `wgpu` and WGSL compute shaders.
+**Primary Objective:** Migrate all image processing to a 32-bit floating-point WGSL compute pipeline running on a shared GPU device with Iced, achieving $< 4\text{ ms}$ frame execution.
 
 ### 2.1 Tasks & Deliverables
 
-* [ ] **WGPU Pipeline Initialization (`halation-gpu`):**
-  * Initialize `wgpu::Device`, `wgpu::Queue`, and `wgpu::CommandEncoder`.
-  * Compile and validate `assets/shaders/develop_pipeline.wgsl` via `wgpu::include_wgsl!`.
-* [ ] **GPU Buffer & Texture Topology (`halation-gpu`):**
-  * Create an input texture: `texture_2d<f32>` (`Rgba16Float` or `Rgba32Float` linear).
-  * Create a ping-pong output compute target: `texture_storage_2d<rgba16float, write>`.
-  * Allocate the 16-byte aligned `GpuDevelopUniforms` uniform buffer.
-* [ ] **WGSL Compute Pipeline Implementation (`assets/shaders/develop_pipeline.wgsl`):**
-  * Implement compute workgroup $(16 \times 16)$ kernel for:
-    1. Linear exposure scaling: $C_{\text{out}} = C_{\text{in}} \cdot 2^{\text{EV}}$.
-    2. White balance matrix multiply (Bradford transform).
-    3. Contrast S-curve around $18\%$ neutral gray.
-    4. Highlight recovery and shadow lifting.
-* [ ] **GPU Readback / Surface Presentation (`halation-pipeline` + `halation-ui`):**
-  * Implement zero-copy blit from `output_tex` to the Iced swapchain texture view.
-  * Benchmark slider-to-frame dispatch latency; target $< 4\text{ ms}$ compute execution time.
+*   [ ] **Shared Device Architecture (`halation-gpu`):**
+    *   Initialize a single `wgpu::Device` and `wgpu::Queue` shared across `halation-gpu` and `iced_wgpu`.
+    *   Eliminate inter-device staging copies by using `iced::advanced::widget::shader::Program` to blit the compute texture view directly to the swapchain.
+*   [ ] **Linear ProPhoto Working Space WGSL Pipeline (`assets/shaders/develop_pipeline.wgsl`):**
+    *   Workgroup size $(16 \times 16)$ compute shader processing linear 32-bit float buffers.
+    *   Implement Bradford matrix transform in LMS space for white balance.
+    *   Implement linear exposure scaling: $C_{\text{exposed}} = C_{\text{in}} \cdot 2^{\text{exposure}}$.
+    *   Implement log-domain highlight and shadow reconstruction using normalized ProPhoto RGB luminance weights:
+        $$\mathbf{Y}_{\text{ProPhoto}} = [0.28804,\ 0.71187,\ 0.00009]$$
+    *   Implement radiometric sigmoidal contrast pivoting around $18\%$ neutral gray in log space:
+        $$C_{\text{contrast}} = \left(\frac{C_{\text{toned}}}{0.18}\right)^\gamma \cdot 0.18 \quad \text{where } \gamma = 1.0 + (\text{contrast} \cdot 0.005)$$
+*   [ ] **Memory Layout Alignment (`halation-core`):**
+    *   Align `GpuDevelopUniforms` to 48 bytes (multiple of 16 bytes for std140).
+    *   Implement `GpuMat3x3` with 16-byte padded column vectors (`col0: [f32; 4]`, etc.).
+*   [ ] **ParamTransaction State Management:**
+    *   Implement atomic ring-buffer streaming (`crossbeam::queue::ArrayQueue`) from UI to GPU.
+    *   Decouple ephemeral 120 FPS slider dragging from persistent catalog database commits.
 
 ### 2.2 Definition of Done (DoD)
-* Sliders drive GPU compute passes directly on the active hardware adapter (e.g., Intel Iris Xe / NVIDIA RTX).
-* CPU usage drops to $< 1\%$ during continuous slider dragging.
-* Viewport runs locked at $120\text{ FPS}$ during parameter scrubbing.
+* Dragging the Exposure slider updates the 45-megapixel viewport at 120 FPS on dedicated GPUs and $\ge 60\text{ FPS}$ on Intel Iris Xe / Apple M-series.
+* CPU utilization remains $< 2\%$ during continuous slider dragging.
+* Contrast adjustments do not invert deep shadows or crush highlights to black.
 
 ---
 
-## Sprint 3: Viewport Ergonomics & Navigation
+## Sprint 3: High-Performance Viewport & Precision Canvas Navigation
 
-**Primary Objective:** Deliver Lightroom-standard viewport navigation: panning, continuous scaling, pixel-peeping modes, and Before/After split screens.
+**Primary Objective:** Deliver precision darkroom navigation: buttery-smooth panning, continuous zoom, 1:1 pixel peeping, interactive Navigator mini-map, and split Before/After comparison.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ VIEWPORT NAVIGATION STATE MACHINE                                            │
+│ [Fit] ◄──(Click / 'Z')──► [1:1 100%] ◄──(Wheel)──► [Continuous 25%..800%]   │
+│   │                              │                                           │
+│   └── (Mini-Map Overview)        └── (Space + Drag / Middle Mouse Pan)       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 3.1 Tasks & Deliverables
 
-* [ ] **Zoom Mode State Machine (`halation-ui`):**
-  * Implement discrete zoom states: `Fit` (scale to window), `Fill` (crop to fill), `1:1` (100% actual pixels), `2:1` (200%), and `4:1` (400%).
-  * Keyboard shortcut `Z` or single-click toggles between `Fit` and `1:1`.
-* [ ] **Pan & Drag Navigation:**
-  * In `1:1`+ zoom modes, holding `Space` (or mouse middle-click) engages the grab cursor.
-  * Moving the mouse updates the normalized viewport translation vector $(\Delta x, \Delta y)$ clamped to image boundaries.
-  * Mouse wheel scroll zooms smoothly centered around the cursor position.
-* [ ] **Navigator Thumbnail Widget (`halation-ui`):**
-  * Render a persistent $180\text{ px}$ mini-preview in the left panel.
-  * Draw a red rectangular viewport boundary indicator over the thumbnail showing the currently visible crop window.
-  * Dragging inside the mini-preview repositions the main canvas in real time.
-* [ ] **Before / After Comparison (`\` shortcut):**
-  * Implement `ViewMode::Single`, `ViewMode::SplitSideBySide`, and `ViewMode::SplitTopBottom`.
-  * Render a movable vertical divider bar across the canvas: Left half = RAW unedited baseline; Right half = active Develop parameter stack.
+*   [ ] **Viewport Canvas Engine (`halation-ui`):**
+    *   Implement `Canvas` state machine: `ZoomMode::Fit`, `Fill`, `ActualSize (1:1)`, `Zoom(f32)`.
+    *   `Z` key or single click toggles instantly between `Fit` and `1:1 (100%)`.
+    *   Mouse wheel zooms continuously, centered mathematically on the cursor's normalized image coordinate.
+*   [ ] **Pan & Kinetic Drag Navigation:**
+    *   Holding `Space` or pressing middle-mouse activates the grab hand cursor (`CursorIcon::Grab` $\to$ `Grabbing`).
+    *   Clamped translation vector $(\Delta x, \Delta y)$ prevents panning the image completely off-screen.
+*   [ ] **Navigator Mini-Map Widget (`halation-ui`):**
+    *   Render a persistent $180\text{ px}$ wide overview thumbnail in the top of the Left Panel.
+    *   Draw an interactive red viewport boundary rectangle (`1.5px` border) showing the visible crop frustum.
+    *   Clicking or dragging inside the mini-map repositions the main canvas loupe in real time.
+*   [ ] **Before / After Comparison Engine (`\` shortcut):**
+    *   Implement comparison modes:
+        *   `Toggle`: Holding `\` shows unedited camera baseline; releasing restores edits.
+        *   `SplitVertical`: Movable split-screen divider with a 2px high-contrast handle line.
+        *   `SideBySide`: Two synchronized viewports panning and zooming in lockstep.
 
 ### 3.2 Definition of Done (DoD)
-* Pressing `1:1` instantly magnifies to native pixel resolution; mouse dragging pans across a 45-megapixel image smoothly.
-* Pressing `\` instantly reveals the unedited original frame with zero hitching.
+* Pressing `1:1` instantly magnifies a 45 MP image with zero hitching.
+* Holding `Space` and dragging pans across native pixels at display refresh rate.
+* Movable Before/After split bar shows active edits on the right and pristine RAW sensor data on the left.
 
 ---
 
-## Sprint 4: Specialized Photography Widgets
+## Sprint 4: Tactile Darkroom Widgets & Custom Iced Primitives
 
-**Primary Objective:** Replace basic Iced sliders with purpose-built darkroom widgets matching Lightroom Classic’s physical tactility.
+**Primary Objective:** Replace crude stock sliders with purpose-built darkroom controls: Scrubby Sliders with dynamic gradient tracks, an interactive 5-zone histogram, an analytical Tone Curve, and 3-way color wheels.
 
 ### 4.1 Tasks & Deliverables
 
-* [ ] **The Scrubby Slider Widget (`crates/halation-ui/src/widgets/scrubby_slider.rs`):**
-  * Custom `iced::advanced::Widget` implementation combining Label, Track, Thumb, and Value Readout.
-  * Relative mouse scrubbing: Click-dragging the numeric readout locks the OS cursor, emitting relative motion events ($\Delta x$).
-  * Precision mod: `Shift` key reduces slider increment by $10\times$.
-  * Reset default: Double-clicking label, thumb, or text snaps parameter to `default_value`.
-  * Dynamic track gradients: Temperature slider renders Kelvin blackbody gradient; Tint slider renders Green-to-Magenta.
-* [ ] **Interactive 5-Zone Histogram (`crates/halation-ui/src/widgets/histogram.rs`):**
-  * Direct-manipulation zones: Blacks ($0$–$10\%$), Shadows ($10$–$35\%$), Exposure ($35$–$65\%$), Highlights ($65$–$90\%$), Whites ($90$–$100\%$).
-  * Hovering a zone renders an alpha-blended polygon overlay.
-  * Horizontal click-dragging inside a zone directly streams parameter deltas to the corresponding slider and compute pipeline.
-* [ ] **Monotone Cubic Spline Tone Curve (`crates/halation-ui/src/widgets/tone_curve.rs`):**
-  * Implement Fritsch-Carlson monotone cubic spline interpolation in `halation-color`.
-  * Draw vector spline curve over the background histogram.
-  * Support clicking anywhere on the curve to add control points; drag control points on $[0.0, 1.0]$; right-click / double-click to remove.
-  * Channel selector: Composite RGB, Red, Green, Blue.
-  * Generate 256-entry 1D LUT and upload to GPU `texture_1d<f32>` on modification.
-* [ ] **3-Way Color Grading Wheels (`crates/halation-ui/src/widgets/color_wheel.rs`):**
-  * Polar coordinate widget: Radius = Saturation $[0.0, 1.0]$, Angle = Hue $[0^\circ, 360^\circ]$.
-  * Central puck with reset anchor dot for Shadows, Midtones, and Highlights.
+```
+SCRUBBY SLIDER SPECIFICATION:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Exposure        ═══════════════════════●═══════════════════       +0.41 EV │
+│ (11px Gray)     (2px Recessed Track, 12px Circular Thumb)   (Mono Readout)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+*   [ ] **Scrubby Slider Implementation (`crates/halation-ui/src/widgets/scrubby_slider.rs`):**
+    *   Custom `iced::advanced::Widget` combining Label (left), Track (center), and Editable Monospace Value (right).
+    *   Click-dragging on the numeric readout locks the OS cursor and emits relative motion deltas ($\Delta x$).
+    *   `Shift` modifier key drops drag sensitivity by $10\times$ for micro-adjustments.
+    *   Double-clicking label, thumb, or text snaps the parameter to its calibrated default.
+    *   **Dynamic Gradient Tracks:**
+        *   Temperature slider: Linear gradient track from Deep Amber (`#ff9326`, $2000\text{ K}$) to Icy Blue (`#5eb5ff`, $50000\text{ K}$).
+        *   Tint slider: Linear gradient from Green (`#30d158`) to Magenta (`#bf5af2`).
+*   [ ] **Interactive 5-Zone Histogram (`crates/halation-ui/src/widgets/histogram.rs`):**
+    *   Render real-time logarithmic 256-bin histogram: Red, Green, Blue, and combined Luminance curves.
+    *   5 interactive zones: Blacks ($0–10\%$), Shadows ($10–35\%$), Exposure ($35–65\%$), Highlights ($65–90\%$), Whites ($90–100\%$).
+    *   Hovering over a zone highlights it with an alpha-blended white overlay (`rgba(255, 255, 255, 0.08)`).
+    *   Horizontal click-dragging inside a zone modulates the corresponding parameter directly.
+    *   Clipping badges in top corners: Blue triangle (Shadows $< 0.0$), Red triangle (Highlights $> 1.0$); clicking toggles canvas clipping masks (`J`).
+*   [ ] **Analytical Tone Curve Widget (`crates/halation-ui/src/widgets/tone_curve.rs`):**
+    *   Monotone cubic spline interpolation (Fritsch-Carlson) evaluated without overshoot artifacts.
+    *   Spline points uploaded as piecewise polynomial uniform structs ($a x^3 + b x^2 + c x + d$) to WGSL, completely eliminating the shadow-quantization bug of 256-entry linear LUTs.
+    *   Channel selector tabs: RGB Composite (White), Red, Green, Blue.
+    *   Visual grid lines at $25\%$, $50\%$, and $75\%$ tonal intersections.
+*   [ ] **3-Way Color Wheels (`crates/halation-ui/src/widgets/color_wheel.rs`):**
+    *   Polar color wheels for Shadows, Midtones, and Highlights.
+    *   Angle maps to Hue ($0^\circ–360^\circ$); radial distance maps to Saturation ($0.0–1.0$).
+    *   Central puck with auto-snap anchor dot; vertical slider beside each wheel to modulate Luminance.
 
 ### 4.2 Definition of Done (DoD)
-* Double-clicking any slider snaps it back to neutral calibrated default.
+* Double-clicking any slider thumb or label snaps it back to neutral calibrated default.
 * Dragging inside the Exposure zone of the histogram dynamically updates the Exposure slider.
-* The Tone Curve allows placing control points without spline overshoot artifacts.
+* The Tone Curve allows placing control points with zero spline ripple or shadow banding.
 
 ---
 
-## Sprint 5: Deep Color Engine & Display Gamut Mapping
+## Sprint 5: Deep Color Engine, Bradford CAT & Display Gamut Mapping
 
-**Primary Objective:** Deliver rigorous color fidelity: wide-gamut working spaces (ProPhoto RGB / ACEScg), OS monitor profile detection, and 3D tetrahedral LUT color transformations.
+**Primary Objective:** Guarantee reference-grade color fidelity: automatic monitor ICC profile detection, Bradford chromatic adaptation, and 3D tetrahedral display LUT gamut mapping.
 
 ### 5.1 Tasks & Deliverables
 
-* [ ] **OS Display Profile Query (`halation-color`):**
-  * Windows: Use `windows::Win32::Graphics::Gdi::GetICMProfileW` on the current window `HDC` to read the calibrated monitor ICC profile path from disk.
-  * macOS: Query `NSScreen.colorSpace` via `objc2-app-kit`.
-  * Watch for window migration across monitors with differing gamuts (e.g., dragging from sRGB laptop screen to a wide-gamut Display P3 monitor).
-* [ ] **Tetrahedral 3D LUT Generator (`halation-color` + `moxcms`):**
-  * Parse the monitor ICC profile via `moxcms`.
-  * Construct a $33 \times 33 \times 33$ 3D LUT transforming linear ProPhoto RGB $\to$ calibrated monitor color space.
-  * Upload the LUT to `wgpu::Texture` (`texture_3d<f32>`).
-* [ ] **Display Blit Shader (`assets/shaders/display_blit.wgsl`):**
-  * Sample the 3D LUT via tetrahedral or trilinear interpolation in the final swapchain render pass.
-  * Implement spatial blue-noise dithering to eliminate 8-bit banding on standard SDR panels.
+*   [ ] **Platform Display Profile Discovery (`halation-color`):**
+    *   **Windows:** Query `GetICMProfileW` on the current window `HDC`.
+    *   **macOS:** Call `CGDisplayCopyColorSpace` via CoreGraphics/AppKit bindings.
+    *   **Linux:** Parse X11 `_ICC_PROFILE` atom or query Wayland `color-management-v1`.
+    *   Detect cross-monitor window migration; trigger dynamic recalibration.
+*   [ ] **3D Tetrahedral Display LUT Generator (`halation-color` + `moxcms`):**
+    *   Parse the monitor's ICC profile using `moxcms`.
+    *   Generate a $33 \times 33 \times 33$ 3D LUT mapping Linear ProPhoto RGB directly to the calibrated monitor gamut and transfer function (sRGB / Display P3 / Rec.2020).
+    *   Upload the table to a 3D float texture (`texture_3d<f32>`).
+*   [ ] **Display Presentation Blit (`assets/shaders/display_blit.wgsl`):**
+    *   Sample the 3D LUT using hardware trilinear/tetrahedral filtering in the final swapchain blit.
+    *   Implement spatial blue-noise dithering to eliminate 8-bit banding on standard SDR panels.
 
 ### 5.2 Definition of Done (DoD)
-* Moving the application window from an sRGB display to a Display P3 / wide-gamut monitor dynamically recalibrates the display LUT.
-* Deep saturated reds, greens, and blues match Adobe Lightroom Classic’s rendering of the same RAW file with zero gamut clipping.
+* Moving the application window from an sRGB laptop screen to a wide-gamut Display P3 monitor dynamically updates the display LUT in $< 50\text{ ms}$.
+* Deep saturated reds, greens, and skin tones match reference darkroom outputs with zero gamut clipping.
 
 ---
 
-## Sprint 6: Catalog Scaling & Digital Asset Management (DAM)
+## Sprint 6: 100k Virtualized Catalog, SQLite WAL & Local Culling
 
-**Primary Objective:** Transform Halation into a production-grade digital darkroom capable of fluidly navigating 100,000+ RAW photos.
+**Primary Objective:** Build an industrial digital asset management system: virtualized infinite grid, multi-tier LRU thumbnail caching, and fast local assisted culling.
 
 ### 6.1 Tasks & Deliverables
 
-* [ ] **High-Throughput SQLite Schema Optimization (`halation-catalog`):**
-  * Enforce Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and `PRAGMA synchronous = NORMAL;`.
-  * Build composite indexes on `(rating, flag, capture_time)`.
-* [ ] **Virtualized Grid & Filmstrip Widget (`halation-ui`):**
-  * Implement an infinite virtual scroll area in Iced that only renders cells visible in the viewport ($+2$ row buffer).
-  * Support keyboard navigation: Arrow keys to move selection, `1`–`5` for star ratings, `6`–`9` for color labels, `P`/`X`/`U` for Pick/Reject/Unflag.
-  * Marquee multi-selection and `Shift`-click range selection.
-* [ ] **Multi-Tier Thumbnail Cache Engine (`halation-pipeline`):**
-  * Tier 1 (Memory): 500-item LRU cache of decoded $256\text{ px}$ micro-thumbnails.
-  * Tier 2 (Disk): Fast compressed WebP thumbnails stored in `.halation-cache/` named by `blake3` file hashes.
-  * Background worker threads asynchronously decode and scale thumbnails without stuttering the scrolling grid.
+*   [ ] **Virtualized Grid & Filmstrip Widget (`halation-ui`):**
+    *   Virtual scrolling grid rendering only visible items $+ 2$ row buffer.
+    *   Keyboard navigation: Arrow keys to move selection, `1`–`5` for star ratings, `6`–`9` for color labels, `Z`/`X`/`U` for Pick/Reject/Unflag.
+    *   Badges on thumbnails: Rating stars, pick flag icon, file format chip (`RAW`, `DNG`, `JPG`).
+*   [ ] **Two-Tier LRU Thumbnail Cache Engine (`halation-pipeline`):**
+    *   Tier 1 (Memory): 500-item LRU cache of decoded $256\text{ px}$ micro-thumbnails.
+    *   Tier 2 (Disk): Fast WebP/LZ4 thumbnails stored in `.halation/cache/` keyed by `blake3` file hashes.
+    *   Background Rayon workers asynchronously decode and downscale previews without dropping grid scroll frames.
+*   [ ] **Local Assisted Culling Engine (`halation-pipeline`):**
+    *   Local multi-threaded analysis pass (zero network requests):
+        *   Subject Sharpness: High-frequency Laplacian gradient variance.
+        *   Eye State / Blink Detection: Eye Aspect Ratio (EAR) metric identifying closed eyes.
+        *   Technical Rejects: Detection of severe camera motion shake or blown highlights.
+    *   UI badges: `Select` (Green) and `Reject` (Red) with real-time threshold filter sliders.
 
 ### 6.2 Definition of Done (DoD)
-* Ingest a catalog folder containing 5,000+ RAW photos.
-* Scrolling the grid with a high-speed mouse wheel maintains a locked $60$–$120\text{ FPS}$ with zero UI freezes.
-* Pressing `P` on an image flags it as "Pick" in memory and commits the change to SQLite in $< 2\text{ ms}$.
+* Smooth, locked 60–120 FPS scrolling across a catalog of 10,000+ RAW images.
+* Pressing `Z` flags an image as "Pick" in memory and commits the change to SQLite in $< 2\text{ ms}$.
+* Assisted Culling flags misfocused shots and blinks across 100 images locally in $< 5\text{ seconds}$.
 
 ---
 
-## Sprint 7: Non-Destructive History DAG & XMP Sync
+## Sprint 7: Non-Destructive History DAG & Adobe-Compatible XMP Sync
 
-**Primary Objective:** Implement an infallible, branching undo/redo history graph and Adobe-compatible `.xmp` sidecar synchronization.
+**Primary Objective:** Deliver an infallible, branching undo/redo graph and bidirectional Adobe-compatible `.xmp` sidecar synchronization.
+
+```
+       [Node 1: Import Baseline]
+                   │
+                   ▼
+       [Node 2: Exposure +0.50 EV]
+                   │
+         ┌─────────┴─────────┐ (Undo 1 step + modify parameter)
+         ▼                   ▼
+[Node 3: Contrast +20]   [Node 4: Temp 6500K] (Active Head Pointer)
+         │
+         ▼
+[Node 5: B&W Conversion]
+```
 
 ### 7.1 Tasks & Deliverables
 
-* [ ] **Interaction Coalescing & History DAG (`halation-core` + `halation-catalog`):**
-  * Differentiate between continuous slider dragging (transient updates) and mouse release (history commit).
-  * On mouse release, compute `blake3` hash of the new parameter state.
-  * If different from the current parent node, insert a new record into `develop_history`.
-  * Support branching: undoing 3 steps and making a new adjustment creates a branch node rather than truncating history.
-* [ ] **History Panel UI (`halation-ui`):**
-  * Render a vertical timeline in the left panel showing every action (e.g., *"Imported"*, *"Exposure +0.50"*, *"Tone Curve"*, *"Contrast -10"*).
-  * Clicking any step reverts the canvas and develop sliders to that exact historical state.
-* [ ] **XMP Sidecar Serialization & Deserialization (`halation-catalog`):**
-  * Implement an Adobe-compatible XML serializer/parser for `.xmp` sidecars.
-  * Read existing Adobe Lightroom develop settings (`crs:Exposure2012`, `crs:Temperature`, etc.) from companion `.xmp` files on disk.
-  * Debounced asynchronous background write: after $500\text{ ms}$ of user idle time, write the updated parameter state back to the companion `.xmp` file.
+*   [ ] **Branching History DAG Traversal (`halation-catalog`):**
+    *   Implement `develop_history` with `parent_history_id` self-referencing hierarchy.
+    *   Track active head via `develop_states.active_history_id`.
+    *   Undoing 3 steps and moving a new slider spawns a new branch node, preserving all historical edits without truncation.
+*   [ ] **History Panel UI Component (`halation-ui`):**
+    *   Render an interactive vertical tree in the Left Panel.
+    *   Format action labels with explicit parameter deltas:
+        $$\text{\texttt{Exposure +0.50 EV \textbar\ Contrast -15 \textbar\ Tone Curve Red}}$$
+    *   Clicking any historical node restores the viewport and slider controls to that exact parameter state.
+*   [ ] **Bidirectional Adobe-Compatible XMP Sync Engine (`halation-catalog`):**
+    *   Parse and serialize `.xmp` packets matching Adobe XMP Core (`crs:Exposure2012`, `crs:Temperature`, `crs:Tint`, `crs:Contrast2012`, etc.).
+    *   Debounced asynchronous background write: $500\text{ ms}$ after the user stops moving sliders, write the parameter payload to the companion `.xmp` file on disk.
 
 ### 7.2 Definition of Done (DoD)
-* Adjusting an image, closing Halation, and opening the image in Adobe Lightroom Classic reveals identical slider values read from the companion `.xmp`.
-* User can traverse 50 undo steps back and forth without state corruption.
+* Edits performed in Halation write an `.xmp` sidecar that opens with identical slider positions in Adobe Lightroom Classic.
+* User can traverse 50 undo/redo steps across multiple branches with zero state corruption.
 
 ---
 
-## Sprint 8: Batch Export & Neural Vision Acceleration
+## Sprint 8: Decoupled On-Device AI Masking & High-Throughput Export
 
-**Primary Objective:** Deliver an industrial-grade batch export engine and hardware-accelerated AI segmentation masks.
+**Primary Objective:** Deliver hardware-accelerated local neural masking (Subject/Sky selection) via a decoupled two-stage inference model, along with a multi-threaded batch export queue.
 
 ### 8.1 Tasks & Deliverables
 
-* [ ] **Batch Export Queue (`halation-pipeline` + `apps/halation-desktop`):**
-  * Background multi-core export pipeline decoupled from the UI thread.
-  * Options dialog: File format (JPEG, TIFF 8/16-bit, PNG, AVIF), color space (sRGB, Adobe RGB, ProPhoto), dimension scaling (Lanczos3 resampling), and output sharpening.
-  * Progress HUD in the top bar showing active export progress and time remaining.
-* [ ] **AI Neural Vision Engine (`crates/halation-ml`):**
-  * Integrate `ort` (ONNX Runtime) with **DirectML** execution provider on Windows.
-  * Load quantized vision weights (e.g., MobileSAM / SAM for subject and sky segmentation).
-  * One-click **"Select Subject"** and **"Select Sky"** generating 8-bit precision bitmasks.
-  * Upload masks directly into `wgpu::Texture` to apply localized exposure/color adjustments.
+*   [ ] **Decoupled Two-Stage Neural Mask Engine (`halation-ml`):**
+    *   Integrate `ort` (ONNX Runtime) with DirectML (Windows), CoreML (macOS), and CPU fallback (Linux).
+    *   **Stage 1 (Background Embedding Worker):** Asynchronously runs MobileSAM quantized image encoder when an image is selected in the Loupe, producing an image embedding tensor $[1, 256, 64, 64]$.
+    *   **Stage 2 (Interactive Prompt Decoder):** When user clicks "Select Subject" or "Select Sky", the prompt decoder evaluates the cached embedding in $< 15\text{ ms}$, outputting an 8-bit precision mask.
+    *   Upload the mask directly to a `wgpu::TextureView` and bind it to the local adjustment shader pass.
+*   [ ] **Multi-Threaded Batch Export Pipeline (`halation-pipeline`):**
+    *   Background Rayon export engine decoupled from the UI thread.
+    *   Export Dialog:
+        *   Formats: JPEG (Quality 1–100%), TIFF (8/16-bit), PNG, WebP, Linear DNG.
+        *   Resampling: High-quality Lanczos3 dimension scaling.
+        *   Color Space Conversion: Embeds output ICC profiles (sRGB, Adobe RGB, Display P3, ProPhoto).
+        *   Watermark: Vector text or transparent PNG graphic with sub-pixel anchoring.
+    *   Header progress bar displaying export count, percentage, and estimated time remaining.
+*   [ ] **External Editor Integration:**
+    *   Configure external editor paths in Preferences (e.g., Affinity Photo, GIMP).
+    *   "Open in External Editor" (`Ctrl/Cmd+Alt+E`) writes a 16-bit ProPhoto TIFF to disk, launches the external executable, and watches for file updates.
 
 ### 8.2 Definition of Done (DoD)
-* Export 50 high-resolution RAW images to full-quality sRGB JPEGs in the background while continuing to edit a 51st image with zero slider stutter.
-* Clicking "Select Sky" isolates the sky in $< 250\text{ ms}$ on the Intel Iris Xe GPU via DirectML, enabling localized exposure adjustments restricted to the clouds.
+* Clicking "Select Sky" produces a pixel-accurate mask in $< 20\text{ ms}$ (using precomputed embeddings), allowing localized exposure adjustments to the clouds.
+* Batch export of 50 high-resolution RAW files to sRGB JPEGs saturates CPU/GPU hardware without causing interface lag in the main window.
+* Complete verification under an air-gapped environment confirms zero outbound network sockets.
 
 ---
 
-## Execution Matrix & Milestone Checkpoints
+## Master Sprint Milestone Matrix
 
-| Sprint | Target Subsystem | Primary Crate | Deliverable Milestone |
+| Sprint | Primary Focus | Key Subsystem | Deliverable Milestone |
 | :---: | :--- | :--- | :--- |
-| **1** | Ingestion & EXIF | `halation-raw`, `halation-catalog` | Real RAW/DNG file open via native Windows dialog |
-| **2** | GPU Compute | `halation-gpu`, `assets/shaders` | WGSL shader running sliders at 120 FPS on Vulkan/DX12 |
-| **3** | Navigation | `halation-ui` | Fit, 1:1 pixel peeping, smooth pan, Before/After split |
-| **4** | Custom Widgets | `halation-ui` (custom widgets) | Scrubby sliders, interactive 5-zone histogram, Tone Curve |
-| **5** | Color Engine | `halation-color` | Monitor ICC detection via Win32 + tetrahedral 3D LUT blit |
-| **6** | Catalog Scaling | `halation-catalog`, `halation-pipeline` | 100k photo virtualized grid with multi-tier LRU caching |
-| **7** | History & XMP | `halation-core`, `halation-catalog` | Branching undo DAG + Adobe-compatible XMP sidecar sync |
-| **8** | Export & AI | `halation-ml`, `halation-pipeline` | Multi-core batch export + DirectML subject/sky masking |
+| **1** | Ingestion & Shell | `halation-raw`, `halation-ui` | Professional 3-panel shell + real RAW decoding via LibRaw FFI |
+| **2** | GPU Pipeline | `halation-gpu`, `assets/shaders` | 120 FPS WGSL compute pipeline with linear ProPhoto math |
+| **3** | Navigation | `halation-ui` | Fit, 1:1 pixel peeping, pan hand, Before/After split screen |
+| **4** | Custom Widgets | `halation-ui` (custom widgets) | Scrubby sliders, 5-zone histogram, analytical tone curve |
+| **5** | Color Science | `halation-color` | OS display ICC detection + 3D tetrahedral display LUT |
+| **6** | Catalog Scaling | `halation-catalog`, `halation-pipeline`| 100k photo virtualized grid + local assisted culling |
+| **7** | History & XMP | `halation-core`, `halation-catalog` | Branching DAG undo/redo + Adobe-compatible XMP sidecar sync |
+| **8** | AI & Batch Export | `halation-ml`, `halation-pipeline` | Decoupled on-device SAM masking + multi-threaded export |

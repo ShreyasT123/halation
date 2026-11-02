@@ -7,3 +7,4 @@ edition.workspace = true
 halation-core = { workspace = true }
 image = { workspace = true }
 thiserror = { workspace = true }
+kamadak-exif = { workspace = true }
