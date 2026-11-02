@@ -9,7 +9,10 @@ use halation_pipeline::{
 };
 use halation_raw::{decode_file, RawAsset};
 use iced::{
-    event, keyboard, mouse,
+    event,
+    font::Font,
+    keyboard, mouse,
+    theme::Palette,
     widget::{button, canvas, column, container, image, row, scrollable, slider, text, Space},
     Center, Color, ContentFit, Element, Event, Length, Point, Rectangle, Size, Subscription, Task,
     Theme,
@@ -29,7 +32,21 @@ const PREVIEW_MAX: u32 = 1000;
 
 pub fn run() -> iced::Result {
     iced::application("Halation | Photo Library", update, view)
-        .theme(|_| Theme::Dark)
+        .theme(|_| {
+            Theme::custom(
+                "Halation Darkroom".into(),
+                Palette {
+                    background: Color::from_rgb8(18, 19, 21),
+                    text: Color::from_rgb8(227, 226, 228),
+                    primary: Color::from_rgb8(255, 193, 116),
+                    success: Color::from_rgb8(76, 215, 246),
+                    danger: Color::from_rgb8(255, 180, 171),
+                },
+            )
+        })
+        .default_font(Font::with_name("Segoe UI"))
+        .window_size(Size::new(1200.0, 740.0))
+        .centered()
         .subscription(subscription)
         .run()
 }
@@ -1068,21 +1085,44 @@ impl<'a> PreparedCurve<'a> {
 
 pub fn view(state: &State) -> Element<'_, Message> {
     let nav = row![
-        text("HALATION").size(17),
-        Space::with_width(Length::Fixed(28.0)),
-        button(text("Library")).on_press(Message::Navigate(Page::Library)),
-        button(text("Develop")).on_press(Message::Navigate(Page::Develop)),
-        button(text("Undo")).on_press(Message::HistoryStep(false)),
-        button(text("Redo")).on_press(Message::HistoryStep(true)),
+        text("HALATION").size(18).font(Font::with_name("Segoe UI")),
+        Space::with_width(Length::Fixed(18.0)),
+        button(text("Library"))
+            .style(if state.page == Page::Library {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::Navigate(Page::Library)),
+        button(text("Develop"))
+            .style(if state.page == Page::Develop {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::Navigate(Page::Develop)),
+        button(text("Undo"))
+            .style(button::text)
+            .on_press(Message::HistoryStep(false)),
+        button(text("Redo"))
+            .style(button::text)
+            .on_press(Message::HistoryStep(true)),
         button(text(if state.exporting {
             "Exporting..."
         } else {
             "JPEG"
         }))
+        .style(button::text)
         .on_press(Message::ExportAll(ExportFormat::Jpeg)),
-        button(text("PNG")).on_press(Message::ExportAll(ExportFormat::Png)),
-        button(text("WebP")).on_press(Message::ExportAll(ExportFormat::WebP)),
-        button(text("TIFF")).on_press(Message::ExportAll(ExportFormat::Tiff)),
+        button(text("PNG"))
+            .style(button::text)
+            .on_press(Message::ExportAll(ExportFormat::Png)),
+        button(text("WebP"))
+            .style(button::text)
+            .on_press(Message::ExportAll(ExportFormat::WebP)),
+        button(text("TIFF"))
+            .style(button::text)
+            .on_press(Message::ExportAll(ExportFormat::Tiff)),
         Space::with_width(Length::Fill),
         text(format!(
             "{} photos  ·  {}  ·  {}",
@@ -1091,7 +1131,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
             state.gpu.display_profile
         ))
         .size(11),
-        button(text("Import Photos...")).on_press(Message::Import)
+        button(text("Import photos"))
+            .style(button::primary)
+            .on_press(Message::Import)
     ]
     .spacing(12)
     .align_y(Center);
@@ -1100,11 +1142,15 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Develop => develop_page(state),
     };
     column![
-        container(nav).padding([12, 18]).width(Length::Fill),
-        content,
-        container(text(&state.status).size(11))
-            .padding([7, 18])
+        container(nav)
+            .padding([8, 14])
             .width(Length::Fill)
+            .style(container::rounded_box),
+        content,
+        container(text(&state.status).size(11).font(Font::MONOSPACE))
+            .padding([6, 14])
+            .width(Length::Fill)
+            .style(container::rounded_box)
     ]
     .into()
 }
@@ -1246,6 +1292,7 @@ fn library_page(state: &State) -> Element<'_, Message> {
     .padding(24)
     .width(Length::Fill)
     .height(Length::Fill)
+    .style(container::rounded_box)
     .into()
 }
 
@@ -1597,6 +1644,42 @@ fn develop_page(state: &State) -> Element<'_, Message> {
     } else {
         column![text("HISTORY").size(11)].into()
     };
+    let mut recent = row![].spacing(6).align_y(Center);
+    let recent_start = index.saturating_sub(4);
+    let recent_end = (index + 5).min(state.items.len());
+    for photo_index in recent_start..recent_end {
+        let item = &state.items[photo_index];
+        let thumb: Element<'_, Message> = if let Some(handle) = &state.thumbnails[photo_index] {
+            image(handle.clone())
+                .content_fit(ContentFit::Cover)
+                .width(Length::Fixed(88.0))
+                .height(Length::Fixed(52.0))
+                .into()
+        } else {
+            container(text("Preview").size(9))
+                .width(Length::Fixed(88.0))
+                .height(Length::Fixed(52.0))
+                .center(Length::Fill)
+                .into()
+        };
+        recent = recent.push(
+            button(column![
+                thumb,
+                text(format!("{}  ★{}", item.filename, item.rating)).size(9)
+            ])
+            .padding(4)
+            .style(if photo_index == index {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::Select(photo_index)),
+        );
+    }
+    let recent_strip = container(column![text("RECENT PHOTOS").size(10), recent].spacing(5))
+        .padding(8)
+        .width(Length::Fill)
+        .style(container::rounded_box);
     let canvas = column![
         zoom_controls,
         divider,
@@ -1604,22 +1687,26 @@ fn develop_page(state: &State) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
             .center(Length::Fill),
-        text(metadata).size(11)
+        text(metadata).size(11).font(Font::MONOSPACE),
+        recent_strip
     ]
     .spacing(8)
     .align_x(Center);
     row![
         container(scrollable(column![navigator, history_panel].spacing(18)))
-            .width(Length::Fixed(205.0))
-            .padding([18, 12]),
+            .width(Length::Fixed(250.0))
+            .padding([18, 12])
+            .style(container::rounded_box),
         container(canvas)
             .padding(18)
             .width(Length::Fill)
-            .height(Length::Fill),
+            .height(Length::Fill)
+            .style(container::rounded_box),
         container(scrollable(controls.spacing(12)))
             .padding(16)
-            .width(Length::Fixed(310.0))
+            .width(Length::Fixed(350.0))
             .height(Length::Fill)
+            .style(container::rounded_box),
     ]
     .height(Length::Fill)
     .into()

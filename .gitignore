@@ -1,8 +1,148 @@
-﻿/target
-Cargo.lock
-*.pdb
+﻿# ==========================================
+# Rust / Cargo
+# ==========================================
+
+# Build artifacts
+/target/
+**/target/
+
+# Rust backup and temporary files
+*.rs.bk
+*.rlib
+*.rmeta
+
+# Rust analyzer
+**/.rustc_info.json
+
+# ==========================================
+# IDEs and Editors
+# ==========================================
+
+# VS Code
 .vscode/
+
+# JetBrains
 .idea/
-*.arw
-*.cr3
-*.nef
+*.iml
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Operating System
+# ==========================================
+
+# Windows
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# ==========================================
+# ML Models and Downloaded Weights
+# ==========================================
+
+models/
+*.onnx
+*.data
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.gguf
+*.ggml
+*.tflite
+*.pb
+*.h5
+*.hdf5
+*.model
+*.weights
+
+# Model download caches
+.cache/
+**/.cache/
+huggingface_cache/
+torch_cache/
+
+# ==========================================
+# Python Experiments
+# ==========================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.pyc
+*.pyo
+*.pyd
+
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Python experiment files
+model.py
+
+# ==========================================
+# Generated Files and Dumps
+# ==========================================
+
+all_rust_code.txt
+*.dump
+*.log
+*.tmp
+*.temp
+
+# Generated documentation
+/site/
+
+# ==========================================
+# Environment Variables and Secrets
+# ==========================================
+
+.env
+.env.*
+!.env.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ==========================================
+# Application Build Outputs
+# ==========================================
+
+/dist/
+/build/
+release/
+debug/
+
+# ==========================================
+# Temporary Archives
+# ==========================================
+
+*.zip
+*.tar
+*.tar.gz
+*.7z
