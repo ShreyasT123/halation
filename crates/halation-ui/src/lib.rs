@@ -1,6 +1,5 @@
 use halation_catalog::{Catalog, CatalogItem};
-use halation_core::HistogramData;
-use halation_core::{DevelopParameters, ImageBufferF32};
+use halation_core::{DevelopParameters, HistogramData, ImageBufferF32};
 use halation_gpu::{GpuDevelopEngine, GpuEngineInfo};
 use halation_ml::{Mask, MobileSam};
 use halation_pipeline::{
@@ -28,24 +27,24 @@ use widgets::{
     scrubby_slider::{self, Gradient, Output as SliderOutput},
 };
 
-const PREVIEW_MAX: u32 = 1000;
+const PREVIEW_MAX: u32 = 1200;
 
 pub fn run() -> iced::Result {
-    iced::application("Halation | Photo Library", update, view)
+    iced::application("Halation | Pro Color grading", update, view)
         .theme(|_| {
             Theme::custom(
-                "Halation Darkroom".into(),
+                "Halation Studio Dark".into(),
                 Palette {
-                    background: Color::from_rgb8(18, 19, 21),
-                    text: Color::from_rgb8(227, 226, 228),
-                    primary: Color::from_rgb8(255, 193, 116),
-                    success: Color::from_rgb8(76, 215, 246),
-                    danger: Color::from_rgb8(255, 180, 171),
+                    background: Color::from_rgb8(35, 36, 39),       // #232427
+                    text: Color::from_rgb8(227, 226, 228),          // #e3e2e4
+                    primary: Color::from_rgb8(255, 193, 116),       // Amber #ffc174
+                    success: Color::from_rgb8(76, 215, 246),       // Cyan #4cd7f6
+                    danger: Color::from_rgb8(255, 180, 171),        // Salmon #ffb4ab
                 },
             )
         })
         .default_font(Font::with_name("Segoe UI"))
-        .window_size(Size::new(1200.0, 740.0))
+        .window_size(Size::new(1000.0, 600.0))
         .centered()
         .subscription(subscription)
         .run()
@@ -84,6 +83,7 @@ pub struct State {
     exporting: bool,
     sharpness_threshold: f32,
     clipping_threshold: f32,
+    filter_culling: bool,
     ml: Arc<Mutex<Option<MobileSam>>>,
     mask_overlay: Option<image::Handle>,
     mask_tool: bool,
@@ -103,6 +103,8 @@ pub struct State {
     xmp_generation: u64,
     catalog_scroll_y: f32,
     catalog_view_height: f32,
+    catalog_view_width: f32,
+    catalog_scroll_id: scrollable::Id,
     viewport: Option<image::Handle>,
     histogram: Option<image::Handle>,
     histogram_data: Option<HistogramData>,
@@ -133,6 +135,18 @@ impl Default for State {
             .or_else(|_| Catalog::open_in_memory())
             .expect("catalog initialization failed");
         let items = catalog.load_items();
+        let stored_culling = catalog.load_culling_metrics();
+        let culling_metrics = items
+            .iter()
+            .map(|item| {
+                stored_culling
+                    .get(&item.id)
+                    .map(|(sharpness, clipped_highlights)| CullingMetrics {
+                        sharpness: *sharpness,
+                        clipped_highlights: *clipped_highlights,
+                    })
+            })
+            .collect();
         let count = items.len();
         let cache_root = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -151,10 +165,11 @@ impl Default for State {
             thumbnail_cache: Arc::new(ThumbnailCache::new(cache_root)),
             thumbnails: vec![None; count],
             thumbnail_requested: HashSet::new(),
-            culling_metrics: vec![None; count],
+            culling_metrics,
             exporting: false,
             sharpness_threshold: 0.001,
             clipping_threshold: 0.03,
+            filter_culling: false,
             ml: Arc::new(Mutex::new(None)),
             mask_overlay: None,
             mask_tool: false,
@@ -181,6 +196,8 @@ impl Default for State {
             xmp_generation: 0,
             catalog_scroll_y: 0.0,
             catalog_view_height: 700.0,
+            catalog_view_width: 960.0,
+            catalog_scroll_id: scrollable::Id::unique(),
             viewport: None,
             histogram: None,
             histogram_data: None,
@@ -194,7 +211,7 @@ impl Default for State {
             pan: [0.5, 0.5],
             custom_zoom: 1.0,
             preview_dimensions: (0, 0),
-            status: format!("{} photos in catalog", count),
+            status: format!("{} photos indexed in catalog", count),
         }
     }
 }
@@ -220,6 +237,7 @@ pub enum Message {
     Tint(f32),
     Rating(u8),
     Flag(&'static str),
+    ColorLabel(&'static str),
     Reset,
     Save,
     SetZoom(ZoomMode),
@@ -240,7 +258,7 @@ pub enum Message {
     RefreshDisplay,
     RefreshPreview,
     PhotoDecoded(usize, u64, Result<(RawAsset, CullingMetrics), String>),
-    CatalogScrolled(f32, f32),
+    CatalogScrolled(f32, f32, f32),
     HistoryStep(bool),
     HistorySelect(i64),
     SyncXmp(u64),
@@ -249,6 +267,7 @@ pub enum Message {
     ExportFinished(Result<Vec<Result<PathBuf, String>>, String>),
     SharpnessThreshold(f32),
     ClippingThreshold(f32),
+    ToggleCullingFilter,
     MaskTool(bool),
     MaskPoint([f32; 2]),
     MaskReady(usize, u64, u64, Result<Mask, String>),
@@ -301,6 +320,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                                     match catalog.import_asset(&path, &raw.metadata) {
                                         Ok(id) => {
                                             raw.id = id;
+                                            catalog.save_culling_metrics(
+                                                id,
+                                                metrics.sharpness,
+                                                metrics.clipped_highlights,
+                                            );
                                             imported.push((id, raw, metrics));
                                         }
                                         Err(error) => {
@@ -320,11 +344,23 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             );
         }
         Message::ImportFinished(items, imported, errors) => {
-            let imported_count = imported.len();
+            let count = imported.len();
             state.items = items;
             state.raw_assets = vec![None; state.items.len()];
             state.thumbnails = vec![None; state.items.len()];
-            state.culling_metrics = vec![None; state.items.len()];
+            let stored_culling = state.catalog.load_culling_metrics();
+            state.culling_metrics = state
+                .items
+                .iter()
+                .map(|item| {
+                    stored_culling
+                        .get(&item.id)
+                        .map(|(sharpness, clipped_highlights)| CullingMetrics {
+                            sharpness: *sharpness,
+                            clipped_highlights: *clipped_highlights,
+                        })
+                })
+                .collect();
             state.thumbnail_requested.clear();
             let mut latest = None;
             for (id, raw, metrics) in imported {
@@ -335,9 +371,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
             state.status = if errors.is_empty() {
-                format!("Imported {imported_count} photo(s)")
+                format!("Imported {count} photo(s)")
             } else {
-                format!("Import completed; {} failed: {}", errors.len(), errors[0])
+                format!("Import complete; {} failed: {}", errors.len(), errors[0])
             };
             if let Some(index) = latest {
                 select_photo(state, index);
@@ -345,15 +381,20 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Select(index) => return open_photo(state, index),
         Message::Navigate(page) => state.page = page,
-        Message::CatalogScrolled(y, height) => {
+        Message::CatalogScrolled(y, height, width) => {
             state.catalog_scroll_y = y;
             state.catalog_view_height = height;
-            const ROW_HEIGHT: f32 = 78.0;
-            const HEADER_HEIGHT: f32 = 48.0;
-            let first = (((y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize).saturating_sub(2);
-            let end = (first + (height / ROW_HEIGHT).ceil() as usize + 4).min(state.items.len());
+            state.catalog_view_width = width;
+            const ROW_HEIGHT: f32 = 190.0;
+            const HEADER_HEIGHT: f32 = 58.0;
+            let columns = catalog_columns(width);
+            let first_row = (((y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize).saturating_sub(2);
+            let row_count = (height / ROW_HEIGHT).ceil() as usize + 4;
+            let first = first_row * columns;
+            let visible_items = visible_catalog_indices(state);
+            let end = ((first_row + row_count) * columns).min(visible_items.len());
             let mut tasks = Vec::new();
-            for index in first..end {
+            for index in visible_items.into_iter().skip(first).take(end.saturating_sub(first)) {
                 if state.thumbnails[index].is_none() && state.thumbnail_requested.insert(index) {
                     let path = state.items[index].path.clone();
                     let cache = state.thumbnail_cache.clone();
@@ -440,7 +481,13 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 .enumerate()
                 .map(|(index, item)| {
                     let mut destination = directory.join(&item.filename);
-                    destination.set_extension("jpg");
+                    let ext = match format {
+                        ExportFormat::Jpeg => "jpg",
+                        ExportFormat::Png => "png",
+                        ExportFormat::WebP => "webp",
+                        ExportFormat::Tiff => "tif",
+                    };
+                    destination.set_extension(ext);
                     ExportJob {
                         source: item.path.clone(),
                         destination,
@@ -453,7 +500,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 })
                 .collect();
             state.exporting = true;
-            state.status = format!("Exporting {} photos...", jobs.len());
+            state.status = format!("Exporting {} master exposures...", jobs.len());
             return Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || export_batch(&jobs, format))
@@ -470,7 +517,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     let succeeded = results.iter().filter(|result| result.is_ok()).count();
                     let failed = results.len() - succeeded;
                     if failed == 0 {
-                        format!("Exported {succeeded} photos")
+                        format!("Exported {succeeded} photos successfully")
                     } else {
                         format!("Exported {succeeded}; {failed} failed")
                     }
@@ -478,8 +525,40 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 Err(error) => format!("Export failed: {error}"),
             };
         }
-        Message::SharpnessThreshold(value) => state.sharpness_threshold = value,
-        Message::ClippingThreshold(value) => state.clipping_threshold = value,
+        Message::SharpnessThreshold(value) => {
+            state.sharpness_threshold = value;
+            if state.filter_culling {
+                return Task::done(Message::CatalogScrolled(
+                    state.catalog_scroll_y,
+                    state.catalog_view_height,
+                    state.catalog_view_width,
+                ));
+            }
+        }
+        Message::ClippingThreshold(value) => {
+            state.clipping_threshold = value;
+            if state.filter_culling {
+                return Task::done(Message::CatalogScrolled(
+                    state.catalog_scroll_y,
+                    state.catalog_view_height,
+                    state.catalog_view_width,
+                ));
+            }
+        }
+        Message::ToggleCullingFilter => {
+            state.filter_culling = !state.filter_culling;
+            state.catalog_scroll_y = 0.0;
+            let scroll = scrollable::scroll_to(
+                state.catalog_scroll_id.clone(),
+                scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+            );
+            let thumbnails = Task::done(Message::CatalogScrolled(
+                0.0,
+                state.catalog_view_height,
+                state.catalog_view_width,
+            ));
+            return Task::batch([scroll, thumbnails]);
+        }
         Message::MaskTool(enabled) => state.mask_tool = enabled,
         Message::MaskPoint(point) => {
             let Some(index) = state.selected else {
@@ -489,7 +568,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             let ml = state.ml.clone();
             let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../models/mobilesam/mobilesam-onnx-float");
-            state.status = "Preparing MobileSAM selection...".into();
+            state.status = "Inference: MobileSAM segmentation...".into();
             let generation = state.load_generation;
             state.mask_generation = state.mask_generation.wrapping_add(1);
             let mask_generation = state.mask_generation;
@@ -501,7 +580,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                             *slot = Some(MobileSam::load(&model_dir)?);
                         }
                         slot.as_mut()
-                            .ok_or("MobileSAM did not initialize")?
+                            .ok_or("MobileSAM failed to initialize")?
                             .select_point(&path, point)
                     })
                     .await
@@ -522,11 +601,11 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                             state.mask_overlay =
                                 Some(image::Handle::from_rgba(mask.width, mask.height, rgba));
                             state.mask_tool = false;
-                            state.status = "MobileSAM selection overlay ready".into();
+                            state.status = "MobileSAM target overlay active".into();
                         }
-                        Err(error) => state.status = format!("Could not display mask: {error}"),
+                        Err(error) => state.status = format!("Mask overlay generation failed: {error}"),
                     },
-                    Err(error) => state.status = format!("MobileSAM failed: {error}"),
+                    Err(error) => state.status = format!("MobileSAM inference failed: {error}"),
                 }
             }
         }
@@ -572,7 +651,10 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::RefreshDisplay => {
             refresh_display_profile(state);
-        }
+            if state.thumbnails.iter().all(|t| t.is_none()) && !state.items.is_empty() {
+                return Task::done(Message::CatalogScrolled(0.0, 800.0, 960.0));
+            }
+        },
         Message::RefreshPreview => {
             state.preview_scheduled = false;
             if state.preview_dirty {
@@ -586,7 +668,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.culling_metrics[index] = Some(metrics);
                 if state.selected == Some(index) && state.load_generation == generation {
                     state.loading_photo = false;
-                    state.status = format!("Opened {}", state.items[index].filename);
+                    state.status = format!("Loaded {}", state.items[index].filename);
                     refresh(state);
                 }
             }
@@ -594,7 +676,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 if state.selected == Some(index) && state.load_generation == generation {
                     state.loading_photo = false;
                     state.status =
-                        format!("Could not open {}: {error}", state.items[index].filename);
+                        format!("Failed to load {}: {error}", state.items[index].filename);
                 }
             }
         },
@@ -608,6 +690,12 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some(i) = state.selected {
                 state.catalog.update_flag(state.items[i].id, flag);
                 state.items[i].flag = flag.into();
+            }
+        }
+        Message::ColorLabel(label) => {
+            if let Some(i) = state.selected {
+                state.catalog.update_color_label(state.items[i].id, label);
+                state.items[i].color_label = label.into();
             }
         }
         Message::Reset => {
@@ -631,18 +719,18 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 if let Err(error) =
                     state
                         .catalog
-                        .commit_history(id, "Develop settings", &state.params)
+                        .commit_history(id, "Manual Develop", &state.params)
                 {
-                    state.status = format!("Could not save history: {error}");
+                    state.status = format!("History commit failed: {error}");
                 }
                 if let Err(error) = state.catalog.write_xmp_sidecar(id, &state.params) {
-                    state.status = format!("Saved settings; XMP sidecar failed: {error}");
+                    state.status = format!("XMP sidecar sync failed: {error}");
                 }
                 state.items[i].params = state.params.clone();
-                if !state.status.starts_with("Could not save")
-                    && !state.status.starts_with("Saved settings;")
+                if !state.status.starts_with("History commit failed")
+                    && !state.status.starts_with("XMP sidecar sync failed")
                 {
-                    state.status = "Develop settings saved to history and XMP".into();
+                    state.status = "Edits synced to catalog and XMP sidecar".into();
                 }
             }
         }
@@ -697,12 +785,47 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.preview_dirty = true;
         }
         Message::KeyPressed(key) if state.page == Page::Library => {
+            if matches!(
+                key.as_str(),
+                "ArrowDown" | "ArrowRight" | "ArrowUp" | "ArrowLeft"
+            ) {
+                let visible = visible_catalog_indices(state);
+                if visible.is_empty() {
+                    return Task::none();
+                }
+                let columns = catalog_columns(state.catalog_view_width);
+                let current = state
+                    .selected
+                    .and_then(|selected| visible.iter().position(|index| *index == selected))
+                    .unwrap_or(0);
+                let next_position = match key.as_str() {
+                    "ArrowDown" => (current + columns).min(visible.len() - 1),
+                    "ArrowUp" => current.saturating_sub(columns),
+                    "ArrowRight" => (current + 1).min(visible.len() - 1),
+                    _ => current.saturating_sub(1),
+                };
+                let next = visible[next_position];
+                state.selected = Some(next);
+                const HEADER_HEIGHT: f32 = 58.0;
+                const ROW_HEIGHT: f32 = 190.0;
+                let row_y = HEADER_HEIGHT + (next_position / columns) as f32 * ROW_HEIGHT;
+                let target_y = if row_y < state.catalog_scroll_y {
+                    row_y
+                } else if row_y + ROW_HEIGHT
+                    > state.catalog_scroll_y + state.catalog_view_height
+                {
+                    (row_y + ROW_HEIGHT - state.catalog_view_height).max(0.0)
+                } else {
+                    state.catalog_scroll_y
+                };
+                state.catalog_scroll_y = target_y;
+                return scrollable::scroll_to(
+                    state.catalog_scroll_id.clone(),
+                    scrollable::AbsoluteOffset { x: 0.0, y: target_y },
+                );
+            }
             if let Some(index) = state.selected {
                 match key.as_str() {
-                    "ArrowDown" | "ArrowRight" => {
-                        state.selected = Some((index + 1).min(state.items.len().saturating_sub(1)))
-                    }
-                    "ArrowUp" | "ArrowLeft" => state.selected = Some(index.saturating_sub(1)),
                     "1" | "2" | "3" | "4" | "5" => {
                         let rating = key.parse::<u8>().unwrap_or(0);
                         state.catalog.update_rating(state.items[index].id, rating);
@@ -777,7 +900,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
     if state.preview_dirty && !state.preview_scheduled {
         state.preview_scheduled = true;
         pending.push(Task::perform(
-            async { tokio::time::sleep(std::time::Duration::from_millis(90)).await },
+            async { tokio::time::sleep(std::time::Duration::from_millis(60)).await },
             |_| Message::RefreshPreview,
         ));
     }
@@ -812,7 +935,7 @@ fn select_photo(state: &mut State, index: usize) {
         match decode_file(&state.items[index].path) {
             Ok(raw) => state.raw_assets[index] = Some(raw),
             Err(e) => {
-                state.status = format!("Could not open {}: {e}", state.items[index].filename);
+                state.status = format!("Could not decode {}: {e}", state.items[index].filename);
                 return;
             }
         }
@@ -840,11 +963,34 @@ fn open_photo(state: &mut State, index: usize) -> Task<Message> {
         return Task::none();
     }
     prepare_selected_photo(state, index);
+
+    // Eagerly request thumbnails for nearby filmstrip items
+    let mut tasks = Vec::new();
+    let start = index.saturating_sub(8);
+    let end = (index + 9).min(state.items.len());
+    for i in start..end {
+        if state.thumbnails[i].is_none() && state.thumbnail_requested.insert(i) {
+            let path = state.items[i].path.clone();
+            let cache = state.thumbnail_cache.clone();
+            tasks.push(Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        cache.get_or_create(&path).map(|bytes| (*bytes).clone())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result)
+                },
+                move |result| Message::ThumbnailReady(i, result),
+            ));
+        }
+    }
+
     if state.raw_assets[index].is_some() {
         state.loading_photo = false;
         refresh(state);
         state.page = Page::Develop;
-        return Task::none();
+        return Task::batch(tasks);
     }
     state.loading_photo = true;
     state.viewport = None;
@@ -852,14 +998,21 @@ fn open_photo(state: &mut State, index: usize) -> Task<Message> {
     state.original_asset_index = None;
     state.histogram = None;
     state.histogram_data = None;
-    state.status = format!("Opening {}...", state.items[index].filename);
+    state.status = format!("Decoding {}...", state.items[index].filename);
     let generation = state.load_generation;
     let path = state.items[index].path.clone();
-    Task::perform(
+    let asset_id = state.items[index].id;
+    let catalog = state.catalog.clone();
+    tasks.push(Task::perform(
         async move {
             tokio::task::spawn_blocking(move || {
                 let raw = decode_file(&path).map_err(|e| e.to_string())?;
                 let metrics = analyze_for_culling(&raw);
+                catalog.save_culling_metrics(
+                    asset_id,
+                    metrics.sharpness,
+                    metrics.clipped_highlights,
+                );
                 Ok::<_, String>((raw, metrics))
             })
             .await
@@ -867,7 +1020,8 @@ fn open_photo(state: &mut State, index: usize) -> Task<Message> {
             .and_then(|result| result)
         },
         move |result| Message::PhotoDecoded(index, generation, result),
-    )
+    ));
+    Task::batch(tasks)
 }
 
 fn prepare_selected_photo(state: &mut State, index: usize) {
@@ -924,7 +1078,7 @@ fn refresh(state: &mut State) {
     let w = (raw.buffer.width as f32 * scale).round().max(1.0) as u32;
     let h = (raw.buffer.height as f32 * scale).round().max(1.0) as u32;
     state.preview_dimensions = (w, h);
-    // Decode at source resolution, then sample a bounded viewport buffer for responsive first-pass editing.
+
     let mut pixels = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
@@ -953,71 +1107,18 @@ fn refresh(state: &mut State) {
         state.original_asset_index = Some(index);
     }
     let output = process_frame_with_gpu(&preview, &state.params, state.gpu_engine.as_ref());
-    let gpu_used = output.gpu_used;
     let mut developed = output.display_rgba;
-    if gpu_used {
-        apply_clipping_mask(&mut developed, state.clipping);
-    } else {
-        apply_curve_and_grading(
-            &mut developed,
-            &state.curve_points,
-            &state.wheel_values,
-            state.clipping,
-        );
-    }
+    apply_clipping_mask(&mut developed, state.clipping);
+
     state.viewport = Some(image::Handle::from_rgba(w, h, developed));
     state.histogram = Some(image::Handle::from_rgba(256, 64, output.histogram_rgba));
     state.histogram_data = Some(output.histogram);
 }
 
-fn apply_curve_and_grading(
-    rgba: &mut [u8],
-    curves: &[Vec<[f32; 2]>; 4],
-    wheels: &[(f32, f32, f32); 3],
-    clipping: [bool; 2],
-) {
-    let prepared: [_; 4] = std::array::from_fn(|i| PreparedCurve::new(&curves[i]));
-    let wheel_tints: [[f32; 3]; 3] = std::array::from_fn(|i| {
-        let a = wheels[i].0 * std::f32::consts::TAU;
-        [a.cos(), (a - 2.094).cos(), (a + 2.094).cos()]
-    });
-    for p in rgba.chunks_exact_mut(4) {
-        let rgb = [
-            p[0] as f32 / 255.0,
-            p[1] as f32 / 255.0,
-            p[2] as f32 / 255.0,
-        ];
-        let luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
-        let weights = [
-            (1.0 - luma / 0.42).clamp(0.0, 1.0),
-            (1.0 - ((luma - 0.5).abs() / 0.38)).clamp(0.0, 1.0),
-            ((luma - 0.58) / 0.42).clamp(0.0, 1.0),
-        ];
-        let mut out = rgb;
-        for c in 0..3 {
-            out[c] = prepared[c + 1].sample(rgb[c]);
-        }
-        for c in 0..3 {
-            out[c] = prepared[0].sample(out[c]);
-        }
-        for (wi, (_, sat, lum)) in wheels.iter().enumerate() {
-            for c in 0..3 {
-                out[c] += wheel_tints[wi][c] * sat * weights[wi] * 0.11 + lum * weights[wi] * 0.12;
-            }
-        }
-        let final_luma = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
-        for c in 0..3 {
-            p[c] = (out[c].clamp(0.0, 1.0) * 255.0).round() as u8;
-        }
-        if (clipping[0] && final_luma < 0.015) || (clipping[1] && final_luma > 0.985) {
-            p[0] = if final_luma < 0.015 { 40 } else { 255 };
-            p[1] = if final_luma < 0.015 { 120 } else { 35 };
-            p[2] = if final_luma < 0.015 { 255 } else { 25 };
-        }
-    }
-}
-
 fn apply_clipping_mask(rgba: &mut [u8], clipping: [bool; 2]) {
+    if !clipping[0] && !clipping[1] {
+        return;
+    }
     for pixel in rgba.chunks_exact_mut(4) {
         let luma = 0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
         let low = clipping[0] && luma < 4.0;
@@ -1030,129 +1131,152 @@ fn apply_clipping_mask(rgba: &mut [u8], clipping: [bool; 2]) {
     }
 }
 
-struct PreparedCurve<'a> {
-    points: &'a [[f32; 2]],
-    tangent: Vec<f32>,
-}
-impl<'a> PreparedCurve<'a> {
-    fn new(points: &'a [[f32; 2]]) -> Self {
-        if points.len() < 2 {
-            return Self {
-                points,
-                tangent: vec![],
-            };
-        }
-        let n = points.len();
-        let slopes: Vec<f32> = points
-            .windows(2)
-            .map(|p| (p[1][1] - p[0][1]) / (p[1][0] - p[0][0]).max(1e-5))
-            .collect();
-        let mut tangent = vec![0.0; n];
-        tangent[0] = slopes[0];
-        tangent[n - 1] = slopes[n - 2];
-        for i in 1..n - 1 {
-            tangent[i] = if slopes[i - 1] * slopes[i] <= 0.0 {
-                0.0
-            } else {
-                2.0 * slopes[i - 1] * slopes[i] / (slopes[i - 1] + slopes[i])
-            };
-        }
-        Self { points, tangent }
-    }
-    fn sample(&self, x: f32) -> f32 {
-        if self.points.len() < 2 {
-            return x;
-        }
-        let n = self.points.len();
-        let i = self
-            .points
-            .windows(2)
-            .position(|p| x <= p[1][0])
-            .unwrap_or(n - 2);
-        let (x0, y0) = (self.points[i][0], self.points[i][1]);
-        let (x1, y1) = (self.points[i + 1][0], self.points[i + 1][1]);
-        let h = (x1 - x0).max(1e-5);
-        let t = ((x - x0) / h).clamp(0.0, 1.0);
-        let t2 = t * t;
-        let t3 = t2 * t;
-        ((2.0 * t3 - 3.0 * t2 + 1.0) * y0
-            + (t3 - 2.0 * t2 + t) * h * self.tangent[i]
-            + (-2.0 * t3 + 3.0 * t2) * y1
-            + (t3 - t2) * h * self.tangent[i + 1])
-            .clamp(0.0, 1.0)
-    }
-}
-
 pub fn view(state: &State) -> Element<'_, Message> {
-    let nav = row![
-        text("HALATION").size(18).font(Font::with_name("Segoe UI")),
-        Space::with_width(Length::Fixed(18.0)),
-        button(text("Library"))
+    let brand = row![
+        text("HALATION").size(16).font(Font::with_name("Segoe UI")),
+        container(text("STUDIO").size(10).color(Color::from_rgb8(76, 215, 246)))
+            .padding([2, 5])
+            .style(container::rounded_box),
+    ]
+    .spacing(6)
+    .align_y(Center);
+
+    let nav_module = row![
+        button(text("Library").size(12))
             .style(if state.page == Page::Library {
-                button::secondary
+                button::primary
             } else {
                 button::text
             })
             .on_press(Message::Navigate(Page::Library)),
-        button(text("Develop"))
+        button(text("Develop").size(12))
             .style(if state.page == Page::Develop {
-                button::secondary
+                button::primary
             } else {
                 button::text
             })
             .on_press(Message::Navigate(Page::Develop)),
-        button(text("Undo"))
+    ]
+    .spacing(4)
+    .align_y(Center);
+
+    let loupe_quick = row![
+        button(text("FIT").size(10))
+            .style(if state.zoom == ZoomMode::Fit {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::SetZoom(ZoomMode::Fit)),
+        button(text("100%").size(10))
+            .style(if state.zoom == ZoomMode::Actual {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::SetZoom(ZoomMode::Actual)),
+        button(text("200%").size(10))
+            .style(if state.zoom == ZoomMode::Two {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::SetZoom(ZoomMode::Two)),
+    ]
+    .spacing(2)
+    .align_y(Center);
+
+    let history_actions = row![
+        button(text("Undo").size(11))
             .style(button::text)
             .on_press(Message::HistoryStep(false)),
-        button(text("Redo"))
+        button(text("Redo").size(11))
             .style(button::text)
             .on_press(Message::HistoryStep(true)),
-        button(text(if state.exporting {
-            "Exporting..."
+        button(text(if state.view_mode == ViewMode::Single {
+            "Compare"
         } else {
-            "JPEG"
-        }))
-        .style(button::text)
-        .on_press(Message::ExportAll(ExportFormat::Jpeg)),
-        button(text("PNG"))
+            "Loupe"
+        }).size(11))
+        .style(if state.view_mode != ViewMode::Single {
+            button::secondary
+        } else {
+            button::text
+        })
+        .on_press(Message::ToggleComparison),
+    ]
+    .spacing(4)
+    .align_y(Center);
+
+    let export_actions = row![
+        button(text("JPEG").size(10))
+            .style(button::text)
+            .on_press(Message::ExportAll(ExportFormat::Jpeg)),
+        button(text("PNG").size(10))
             .style(button::text)
             .on_press(Message::ExportAll(ExportFormat::Png)),
-        button(text("WebP"))
+        button(text("WebP").size(10))
             .style(button::text)
             .on_press(Message::ExportAll(ExportFormat::WebP)),
-        button(text("TIFF"))
+        button(text("TIFF").size(10))
             .style(button::text)
             .on_press(Message::ExportAll(ExportFormat::Tiff)),
-        Space::with_width(Length::Fill),
-        text(format!(
-            "{} photos  ·  {}  ·  {}",
-            state.items.len(),
-            state.gpu.adapter_name,
-            state.gpu.display_profile
-        ))
-        .size(11),
-        button(text("Import photos"))
-            .style(button::primary)
-            .on_press(Message::Import)
     ]
-    .spacing(12)
+    .spacing(3)
     .align_y(Center);
-    let content = match state.page {
+
+    let header = container(
+        row![
+            brand,
+            Space::with_width(Length::Fixed(16.0)),
+            nav_module,
+            Space::with_width(Length::Fixed(16.0)),
+            loupe_quick,
+            Space::with_width(Length::Fixed(12.0)),
+            history_actions,
+            Space::with_width(Length::Fill),
+            export_actions,
+            Space::with_width(Length::Fixed(12.0)),
+            button(text("Import Photos").size(11))
+                .style(button::primary)
+                .on_press(Message::Import),
+        ]
+        .align_y(Center)
+    )
+    .padding([6, 14])
+    .width(Length::Fill)
+    .style(container::rounded_box);
+
+    let content: Element<'_, Message> = match state.page {
         Page::Library => library_page(state),
         Page::Develop => develop_page(state),
     };
-    column![
-        container(nav)
-            .padding([8, 14])
-            .width(Length::Fill)
-            .style(container::rounded_box),
-        content,
-        container(text(&state.status).size(11).font(Font::MONOSPACE))
-            .padding([6, 14])
-            .width(Length::Fill)
-            .style(container::rounded_box)
-    ]
-    .into()
+
+    let footer = container(
+        row![
+            text(format!("{} photos indexed", state.items.len()))
+                .size(10)
+                .font(Font::MONOSPACE),
+            Space::with_width(Length::Fixed(12.0)),
+            text(&state.status)
+                .size(10)
+                .font(Font::MONOSPACE)
+                .color(Color::from_rgb8(76, 215, 246)),
+            Space::with_width(Length::Fill),
+            text(format!(
+                "{}  ·  {}",
+                state.gpu.adapter_name, state.gpu.display_profile
+            ))
+            .size(10)
+            .color(Color::from_rgb8(150, 152, 156)),
+        ]
+        .align_y(Center)
+    )
+    .padding([5, 14])
+    .width(Length::Fill)
+    .style(container::rounded_box);
+
+    column![header, content, footer].spacing(4).into()
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
@@ -1176,28 +1300,8 @@ fn subscription(_state: &State) -> Subscription<Message> {
                 }
                 keyboard::Key::Character(value)
                     if [
-                        "z",
-                        "Z",
-                        "j",
-                        "J",
-                        "\\",
-                        "1",
-                        "2",
-                        "3",
-                        "4",
-                        "5",
-                        "6",
-                        "7",
-                        "8",
-                        "9",
-                        "x",
-                        "X",
-                        "u",
-                        "U",
-                        "ArrowUp",
-                        "ArrowDown",
-                        "ArrowLeft",
-                        "ArrowRight",
+                        "z", "Z", "j", "J", "\\", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                        "x", "X", "u", "U",
                     ]
                     .contains(&value) =>
                 {
@@ -1211,89 +1315,218 @@ fn subscription(_state: &State) -> Subscription<Message> {
     });
     Subscription::batch([
         events,
-        iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::RefreshDisplay),
+        iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::RefreshDisplay),
     ])
 }
 
 fn library_page(state: &State) -> Element<'_, Message> {
+    const ROW_HEIGHT: f32 = 190.0;
+    const HEADER_HEIGHT: f32 = 58.0;
+    const GAP: f32 = 12.0;
+    let columns = catalog_columns(state.catalog_view_width);
+    let card_width = ((state.catalog_view_width - 40.0 - GAP * (columns - 1) as f32)
+        / columns as f32)
+        .max(160.0);
     let mut grid = column![
-        text("PHOTO LIBRARY").size(13),
-        text("Your catalog is stored locally and keeps original files untouched.").size(11)
+        row![
+            column![
+                text("PHOTO LIBRARY").size(13),
+                text("Browse, rate, and organize your originals")
+                    .size(11)
+                    .color(Color::from_rgb8(150, 152, 156)),
+            ]
+            .spacing(5),
+            Space::with_width(Length::Fill),
+            text(if state.filter_culling {
+                format!(
+                    "{} SELECTS / {} PHOTOS",
+                    visible_catalog_indices(state).len(),
+                    state.items.len()
+                )
+            } else {
+                format!("{} PHOTOS", state.items.len())
+            })
+                .size(10)
+                .color(Color::from_rgb8(150, 152, 156)),
+            button(text(if state.filter_culling {
+                "SHOW ALL"
+            } else {
+                "FILTER SELECTS"
+            })
+            .size(9))
+            .style(if state.filter_culling {
+                button::secondary
+            } else {
+                button::text
+            })
+            .on_press(Message::ToggleCullingFilter),
+        ]
+        .align_y(Center),
     ]
-    .spacing(10);
+    .spacing(14);
+
     if state.items.is_empty() {
         grid = grid
             .push(Space::with_height(Length::Fixed(60.0)))
-            .push(text("No photos yet").size(24))
-            .push(text("Import JPEG, PNG, TIFF, WebP, or DNG photos to begin.").size(13))
-            .push(button(text("Import Photos")).on_press(Message::Import));
+            .push(text("Catalog Empty").size(22))
+            .push(
+                text("Import raw files (DNG, ARW, CR2, NEF) or standard formats (JPEG, TIFF, PNG).")
+                    .size(12),
+            )
+            .push(button(text("Import Master Files")).on_press(Message::Import));
     } else {
-        const ROW_HEIGHT: f32 = 82.0;
-        const HEADER_HEIGHT: f32 = 48.0;
-        let first = (((state.catalog_scroll_y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize)
-            .saturating_sub(2);
-        let visible = (state.catalog_view_height / ROW_HEIGHT).ceil() as usize + 4;
-        let end = (first + visible).min(state.items.len());
-        if first > 0 {
-            grid = grid.push(Space::with_height(Length::Fixed(first as f32 * ROW_HEIGHT)));
+        let visible_items = visible_catalog_indices(state);
+        if visible_items.is_empty() {
+            grid = grid
+                .push(Space::with_height(Length::Fixed(60.0)))
+                .push(text("No photos meet the current culling thresholds").size(18))
+                .push(
+                    button(text("Show All Photos"))
+                        .on_press(Message::ToggleCullingFilter),
+                );
         }
-        for idx in first..end {
-            let item = &state.items[idx];
-            let preview: Element<'_, Message> = if let Some(handle) = &state.thumbnails[idx] {
-                image(handle.clone())
-                    .content_fit(ContentFit::Contain)
-                    .width(Length::Fixed(116.0))
-                    .height(Length::Fixed(72.0))
-                    .into()
-            } else {
-                container(text("Preview").size(10))
-                    .width(Length::Fixed(116.0))
-                    .height(Length::Fixed(72.0))
-                    .center(Length::Fill)
-                    .into()
-            };
-            grid = grid.push(
-                row![
-                    preview,
-                    button(
-                        text(format!(
-                            "{}    {}  ·  {} MB  ·  {}/5  {}  {}",
-                            if state.selected == Some(idx) {
-                                "●"
+        let row_count = visible_items.len().div_ceil(columns);
+        let first_row = if row_count == 0 {
+            0
+        } else {
+            ((((state.catalog_scroll_y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize)
+                .saturating_sub(2))
+            .min(row_count - 1)
+        };
+        let visible_rows = (state.catalog_view_height / ROW_HEIGHT).ceil() as usize + 4;
+        let end_row = (first_row + visible_rows).min(row_count);
+        if first_row > 0 {
+            grid = grid.push(Space::with_height(Length::Fixed(first_row as f32 * ROW_HEIGHT)));
+        }
+        for row_index in first_row..end_row {
+            let mut cards = row![].spacing(GAP).height(Length::Fixed(ROW_HEIGHT));
+            for idx in visible_items
+                .iter()
+                .skip(row_index * columns)
+                .take(columns)
+                .copied()
+            {
+                let item = &state.items[idx];
+                let is_selected = state.selected == Some(idx);
+                let preview: Element<'_, Message> = if let Some(handle) = &state.thumbnails[idx] {
+                    image(handle.clone())
+                        .content_fit(ContentFit::Contain)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(126.0))
+                        .into()
+                } else {
+                    container(text("Loading preview").size(10).color(Color::from_rgb8(150, 152, 156)))
+                        .width(Length::Fill)
+                        .height(Length::Fixed(126.0))
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .into()
+                };
+                let flag_color = match item.flag.as_str() {
+                    "Pick" => Color::from_rgb8(76, 215, 246),
+                    "Reject" => Color::from_rgb8(255, 180, 171),
+                    _ => Color::from_rgb8(150, 152, 156),
+                };
+                let format = item
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("IMG")
+                    .to_ascii_uppercase();
+                let format = match format.as_str() {
+                    "JPG" | "JPEG" => "JPG",
+                    "TIF" | "TIFF" => "TIFF",
+                    "DNG" => "DNG",
+                    "ARW" | "CR2" | "CR3" | "NEF" | "RAF" | "RW2" | "ORF" => "RAW",
+                    _ => "IMG",
+                };
+                let culling_label = state.culling_metrics[idx].map(|metrics| {
+                    if metrics.sharpness < state.sharpness_threshold
+                        || metrics.clipped_highlights > state.clipping_threshold
+                    {
+                        ("REVIEW", Color::from_rgb8(255, 180, 171))
+                    } else {
+                        ("SELECT", Color::from_rgb8(76, 215, 246))
+                    }
+                });
+                let card = button(
+                    column![
+                        preview,
+                        text(&item.filename).size(11).font(Font::MONOSPACE),
+                        row![
+                            text(format!("* {}", item.rating)).size(10),
+                            text(format).size(9).color(Color::from_rgb8(76, 215, 246)),
+                            text(&item.flag).size(10).color(flag_color),
+                            text(&item.color_label).size(10),
+                            if let Some((label, color)) = culling_label {
+                                text(label).size(9).color(color)
                             } else {
-                                "○"
+                                text("").size(9)
                             },
-                            item.filename,
-                            item.file_size / 1_000_000,
-                            item.rating,
-                            item.flag,
-                            item.color_label
-                        ))
-                        .size(13),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fixed(72.0))
-                    .on_press(Message::Select(idx))
-                ]
-                .spacing(12)
-                .height(Length::Fixed(78.0)),
-            );
+                            Space::with_width(Length::Fill),
+                            text(format!("{:.1} MB", item.file_size as f32 / 1_000_000.0))
+                                .size(9)
+                                .color(Color::from_rgb8(150, 152, 156)),
+                        ]
+                        .spacing(8)
+                        .align_y(Center),
+                    ]
+                    .spacing(7)
+                    .padding(8)
+                    .width(Length::Fill),
+                )
+                .style(if is_selected { button::secondary } else { button::text })
+                .width(Length::Fixed(card_width))
+                .height(Length::Fill)
+                .on_press(Message::Select(idx));
+                cards = cards.push(card);
+            }
+            grid = grid.push(cards);
         }
-        if end < state.items.len() {
+        if end_row < row_count {
             grid = grid.push(Space::with_height(Length::Fixed(
-                (state.items.len() - end) as f32 * ROW_HEIGHT,
+                (row_count - end_row) as f32 * ROW_HEIGHT,
             )));
         }
     }
-    container(scrollable(grid.spacing(2)).on_scroll(|viewport| {
-        let offset = viewport.absolute_offset();
-        Message::CatalogScrolled(offset.y, viewport.bounds().height)
-    }))
-    .padding(24)
+
+    container(
+        scrollable(grid.spacing(0))
+            .id(state.catalog_scroll_id.clone())
+            .on_scroll(|viewport| {
+                let offset = viewport.absolute_offset();
+                let bounds = viewport.bounds();
+                Message::CatalogScrolled(offset.y, bounds.height, bounds.width)
+            }),
+    )
+    .padding(18)
     .width(Length::Fill)
     .height(Length::Fill)
     .style(container::rounded_box)
     .into()
+}
+
+fn catalog_columns(width: f32) -> usize {
+    (((width - 40.0) / 230.0).floor() as usize).clamp(1, 6)
+}
+
+fn visible_catalog_indices(state: &State) -> Vec<usize> {
+    state
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| {
+            if !state.filter_culling {
+                return Some(index);
+            }
+            state.culling_metrics[index]
+                .filter(|metrics| {
+                    metrics.sharpness >= state.sharpness_threshold
+                        && metrics.clipped_highlights <= state.clipping_threshold
+                })
+                .map(|_| index)
+        })
+        .collect()
 }
 
 fn develop_page(state: &State) -> Element<'_, Message> {
@@ -1301,28 +1534,13 @@ fn develop_page(state: &State) -> Element<'_, Message> {
         return library_page(state);
     };
     let item = &state.items[index];
+
     if state.loading_photo {
         return container(
             column![
-                text("OPENING PHOTO").size(12),
-                text(&item.filename).size(21),
-                text("Decoding the image and preparing the develop preview…").size(13),
-            ]
-            .spacing(16)
-            .align_x(Center),
-        )
-        .center(Length::Fill)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
-    }
-    if state.viewport.is_none() {
-        return container(
-            column![
-                text("PHOTO COULD NOT BE OPENED").size(12),
-                text(&item.filename).size(19),
-                text(&state.status).size(13),
-                button(text("Back to Library")).on_press(Message::Navigate(Page::Library)),
+                text("LOADING ASSET").size(12).color(Color::from_rgb8(76, 215, 246)),
+                text(&item.filename).size(20),
+                text("initializing…").size(12),
             ]
             .spacing(12)
             .align_x(Center),
@@ -1332,12 +1550,13 @@ fn develop_page(state: &State) -> Element<'_, Message> {
         .height(Length::Fill)
         .into();
     }
+
     let raw = state.raw_assets[index].as_ref();
     let meta = raw.map(|r| &r.metadata);
-    let metadata = meta
+    let exif_stamp = meta
         .map(|m| {
             format!(
-                "{}   {}   ISO {}   {}   {}",
+                "{} · {} · ISO {} · {} · {}",
                 empty_dash(&m.camera),
                 empty_dash(&m.lens),
                 m.iso.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
@@ -1346,180 +1565,161 @@ fn develop_page(state: &State) -> Element<'_, Message> {
             )
         })
         .unwrap_or_default();
-    let culling = state.culling_metrics[index]
-        .map(|metrics| {
-            format!(
-                "Sharpness {:.3}  ·  clipped {:.2}%",
-                metrics.sharpness,
-                metrics.clipped_highlights * 100.0
-            )
-        })
-        .unwrap_or_else(|| "Culling analysis pending".into());
-    let review_status = state.culling_metrics[index]
-        .map(|metrics| {
-            if metrics.sharpness < state.sharpness_threshold
-                || metrics.clipped_highlights > state.clipping_threshold
-            {
-                "REVIEW"
-            } else {
-                "TECHNICALLY OK"
-            }
-        })
-        .unwrap_or("ANALYSIS PENDING");
-    let mut controls = column![
-        text("DEVELOP").size(13),
-        text(&item.filename).size(12),
-        text(review_status).size(11),
-        text(culling).size(10),
-        text("CULLING THRESHOLDS").size(10),
-        text("Minimum sharpness").size(10),
-        slider(
-            0.0_f32..=0.02_f32,
-            state.sharpness_threshold,
-            Message::SharpnessThreshold
-        )
-        .step(0.0001_f32),
-        text("Maximum clipped highlights").size(10),
-        slider(
-            0.0_f32..=0.25_f32,
-            state.clipping_threshold,
-            Message::ClippingThreshold
-        )
-        .step(0.005_f32),
-        row![
-            button(text(if state.mask_tool {
-                "Cancel point"
-            } else {
-                "Point mask"
-            }))
-            .on_press(Message::MaskTool(!state.mask_tool)),
-            button(text("Sky")).on_press(Message::MaskPoint([0.5, 0.1])),
-            button(text("Subject")).on_press(Message::MaskPoint([0.5, 0.5]))
-        ]
-        .spacing(4),
-        button(text("Clear mask")).on_press(Message::ClearMask),
-        text("RGB HISTOGRAM").size(11)
-    ];
-    controls = controls.push(
-        histogram::view(state.histogram_data.clone(), state.clipping).map(|output| match output {
-            histogram::Output::Adjust(zone, delta) => Message::HistogramAdjust(zone, delta),
-            histogram::Output::ToggleClipping(index) => Message::ToggleClipping(index),
-        }),
-    );
-    controls = controls
-        .push(text("TONE CURVE · RGB").size(11))
-        .push(
+
+    // ==========================================
+    // COLUMN 1: LEFT UTILITY DECK (260px)
+    // ==========================================
+    let navigator: Element<'_, Message> = if let Some(handle) = &state.viewport {
+        column![
             row![
-                button(text("RGB")).on_press(Message::CurveChannel(0)),
-                button(text("R")).on_press(Message::CurveChannel(1)),
-                button(text("G")).on_press(Message::CurveChannel(2)),
-                button(text("B")).on_press(Message::CurveChannel(3)),
+                text("NAVIGATOR").size(11).color(Color::from_rgb8(76, 215, 246)),
+                Space::with_width(Length::Fill),
+                button(text("FIT").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Fit)),
+                button(text("1:1").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Actual)),
+                button(text("2:1").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Two)),
             ]
-            .spacing(4),
-        )
-        .push(
-            widgets::tone_curve::view(state.curve_points[state.curve_channel].clone())
-                .map(|p| Message::CurvePoint(p.0, p.1)),
-        );
-    controls = controls.push(text("COLOR GRADING").size(11));
-    for (index, name) in ["Shadows", "Midtones", "Highlights"].iter().enumerate() {
-        let (hue, saturation, luminance) = state.wheel_values[index];
-        controls = controls.push(
+            .align_y(Center),
+            canvas::Canvas::new(Navigator {
+                handle: handle.clone(),
+                zoom: state.zoom,
+                custom_zoom: state.custom_zoom,
+                pan: state.pan
+            })
+            .width(Length::Fixed(236.0))
+            .height(Length::Fixed(140.0)),
+            text(format!("{} × {} px", state.preview_dimensions.0, state.preview_dimensions.1))
+                .size(9)
+                .color(Color::from_rgb8(150, 152, 156)),
+        ]
+        .spacing(6)
+        .into()
+    } else {
+        column![text("NAVIGATOR").size(11)].into()
+    };
+
+    let history_panel: Element<'_, Message> = {
+        let entries = state.catalog.history(item.id);
+        let active = state.catalog.active_history_id(item.id);
+        let mut list = column![
             row![
-                text(*name).width(Length::Fixed(76.0)).size(11),
-                widgets::color_wheel::view(hue, saturation)
-                    .map(move |v| Message::Wheel(index, v.0, v.1)),
-                slider(-1.0..=1.0, luminance, move |v| Message::WheelLuma(index, v))
-                    .step(0.01_f32)
-                    .width(Length::Fixed(90.0)),
+                text("HISTORY & BRANCHES").size(11).color(Color::from_rgb8(76, 215, 246)),
+                Space::with_width(Length::Fill),
+                text(format!("{} steps", entries.len())).size(9).color(Color::from_rgb8(150, 152, 156)),
             ]
             .align_y(Center)
-            .spacing(8),
-        );
-    }
-    controls = controls
-        .push(control(
-            "Exposure",
-            state.params.exposure,
-            -5.0..=5.0,
-            0.05,
-            Message::Exposure,
-        ))
-        .push(control(
-            "Contrast",
-            state.params.contrast,
-            -100.0..=100.0,
-            1.0,
-            Message::Contrast,
-        ))
-        .push(control(
-            "Highlights",
-            state.params.highlights,
-            -100.0..=100.0,
-            1.0,
-            Message::Highlights,
-        ))
-        .push(control(
-            "Shadows",
-            state.params.shadows,
-            -100.0..=100.0,
-            1.0,
-            Message::Shadows,
-        ))
-        .push(control(
-            "Whites",
-            state.params.whites,
-            -100.0..=100.0,
-            1.0,
-            Message::Whites,
-        ))
-        .push(control(
-            "Blacks",
-            state.params.blacks,
-            -100.0..=100.0,
-            1.0,
-            Message::Blacks,
-        ))
-        .push(text("WHITE BALANCE").size(11))
-        .push(control(
-            "Temperature",
-            state.params.temperature,
-            2000.0..=50000.0,
-            25.0,
-            Message::Temperature,
-        ))
-        .push(control(
-            "Tint",
-            state.params.tint,
-            -150.0..=150.0,
-            1.0,
-            Message::Tint,
-        ))
-        .push(
-            row![
-                button(text("1")).on_press(Message::Rating(1)),
-                button(text("2")).on_press(Message::Rating(2)),
-                button(text("3")).on_press(Message::Rating(3)),
-                button(text("4")).on_press(Message::Rating(4)),
-                button(text("5")).on_press(Message::Rating(5))
+        ]
+        .spacing(4);
+
+        for entry in entries.into_iter().rev() {
+            let is_active = Some(entry.id) == active;
+            list = list.push(
+                button(
+                    row![
+                        text(if is_active { "●" } else { "○" })
+                            .size(10)
+                            .color(if is_active {
+                                Color::from_rgb8(76, 215, 246)
+                            } else {
+                                Color::from_rgb8(150, 152, 156)
+                            }),
+                        text(entry.label).size(10), // <-- Pass owned String by value
+                    ]
+                    .spacing(6)
+                    .align_y(Center),
+                )
+                .style(if is_active {
+                    button::secondary
+                } else {
+                    button::text
+                })
+                .width(Length::Fill)
+                .on_press(Message::HistorySelect(entry.id)),
+            );
+        }
+        list.into()
+    };
+
+    let culling_panel: Element<'_, Message> = {
+        let metrics = state.culling_metrics[index];
+        let status_str = metrics
+            .map(|m| {
+                if m.sharpness < state.sharpness_threshold || m.clipped_highlights > state.clipping_threshold {
+                    ("REVIEW REQUIRED", Color::from_rgb8(255, 180, 171))
+                } else {
+                    ("IN FOCUS · BALANCED", Color::from_rgb8(76, 215, 246))
+                }
+            })
+            .unwrap_or(("PENDING METRICS", Color::from_rgb8(150, 152, 156)));
+
+        column![
+            text("CULLING ANALYSIS").size(11).color(Color::from_rgb8(76, 215, 246)),
+            text(status_str.0).size(10).color(status_str.1),
+            text(metrics.map(|m| format!("Laplacian Focus: {:.4}", m.sharpness)).unwrap_or_default())
+                .size(9)
+                .font(Font::MONOSPACE),
+            text(metrics.map(|m| format!("Clipped Highlights: {:.2}%", m.clipped_highlights * 100.0)).unwrap_or_default())
+                .size(9)
+                .font(Font::MONOSPACE),
+            text("Min Sharpness").size(9).color(Color::from_rgb8(150, 152, 156)),
+            slider(0.0001_f32..=0.015_f32, state.sharpness_threshold, Message::SharpnessThreshold)
+                .step(0.0001_f32),
+            text("Max Highlight Clipping").size(9).color(Color::from_rgb8(150, 152, 156)),
+            slider(0.0_f32..=0.20_f32, state.clipping_threshold, Message::ClippingThreshold)
+                .step(0.005_f32),
+        ]
+        .spacing(4)
+        .into()
+    };
+
+    let left_deck = container(
+        scrollable(
+            column![
+                navigator,
+                container(history_panel).padding(8).style(container::rounded_box),
+                container(culling_panel).padding(8).style(container::rounded_box),
             ]
-            .spacing(3),
+            .spacing(12),
         )
-        .push(
+    )
+    .width(Length::Fixed(260.0))
+    .padding(10)
+    .style(container::rounded_box);
+
+    // ==========================================
+    // COLUMN 2: CENTER STAGE & FILMSTRIP (FILL)
+    // ==========================================
+    let center_toolbar = row![
+        button(text("Loupe").size(10))
+            .style(if state.view_mode == ViewMode::Single { button::secondary } else { button::text })
+            .on_press(Message::SetViewMode(ViewMode::Single)),
+        button(text("Side Split").size(10))
+            .style(if state.view_mode == ViewMode::SplitSideBySide { button::secondary } else { button::text })
+            .on_press(Message::SetViewMode(ViewMode::SplitSideBySide)),
+        button(text("Top Split").size(10))
+            .style(if state.view_mode == ViewMode::SplitTopBottom { button::secondary } else { button::text })
+            .on_press(Message::SetViewMode(ViewMode::SplitTopBottom)),
+        Space::with_width(Length::Fixed(12.0)),
+        button(text(if state.clipping[0] { "▲ Black Clip ON" } else { "▲ Black Clip" }).size(10))
+            .style(if state.clipping[0] { button::secondary } else { button::text })
+            .on_press(Message::ToggleClipping(0)),
+        button(text(if state.clipping[1] { "▼ White Clip ON" } else { "▼ White Clip" }).size(10))
+            .style(if state.clipping[1] { button::danger } else { button::text })
+            .on_press(Message::ToggleClipping(1)),
+        Space::with_width(Length::Fill),
+        if state.view_mode != ViewMode::Single {
             row![
-                button(text("Pick")).on_press(Message::Flag("Pick")),
-                button(text("Reject")).on_press(Message::Flag("Reject")),
-                button(text("Clear flag")).on_press(Message::Flag("None"))
+                text("Split").size(10),
+                slider(0.1_f32..=0.9_f32, state.divider, Message::Divider).width(Length::Fixed(90.0)),
             ]
-            .spacing(3),
-        )
-        .push(
-            row![
-                button(text("Reset")).on_press(Message::Reset),
-                button(text("Save edits")).on_press(Message::Save)
-            ]
-            .spacing(8),
-        );
+            .spacing(6)
+            .align_y(Center)
+        } else {
+            row![]
+        },
+    ]
+    .spacing(4)
+    .align_y(Center);
+
     let viewport: Element<'_, Message> = if let Some(handle) = &state.viewport {
         match state.view_mode {
             ViewMode::Single => canvas::Canvas::new(MainViewport {
@@ -1550,7 +1750,7 @@ fn develop_page(state: &State) -> Element<'_, Message> {
                             .height(Length::Fill)
                             .content_fit(ContentFit::Contain)
                     )
-                    .width(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16))
+                    .width(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16)),
                 ]
                 .height(Length::Fill)
                 .into()
@@ -1571,145 +1771,276 @@ fn develop_page(state: &State) -> Element<'_, Message> {
                             .height(Length::Fill)
                             .content_fit(ContentFit::Contain)
                     )
-                    .height(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16))
+                    .height(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16)),
                 ]
                 .width(Length::Fill)
                 .into()
             }
         }
     } else {
-        text("Select a photo from Library").into()
+        container(text("Select photo to begin develop").size(12))
+            .center(Length::Fill)
+            .into()
     };
-    let zoom_controls = row![
-        button(text("Fit")).on_press(Message::SetZoom(ZoomMode::Fit)),
-        button(text("Fill")).on_press(Message::SetZoom(ZoomMode::Fill)),
-        button(text("1:1")).on_press(Message::SetZoom(ZoomMode::Actual)),
-        button(text("2:1")).on_press(Message::SetZoom(ZoomMode::Two)),
-        button(text("4:1")).on_press(Message::SetZoom(ZoomMode::Four)),
-        Space::with_width(Length::Fill),
-        button(text("Single")).on_press(Message::SetViewMode(ViewMode::Single)),
-        button(text("Before | After")).on_press(Message::SetViewMode(ViewMode::SplitSideBySide)),
-        button(text("Top / Bottom")).on_press(Message::SetViewMode(ViewMode::SplitTopBottom)),
-        button(text("Z: toggle zoom  |  \\: compare")).on_press(Message::ToggleComparison)
-    ]
-    .spacing(5)
-    .align_y(Center);
-    let divider = row![
-        text("Comparison split").size(10),
-        slider(0.2_f32..=0.8_f32, state.divider, Message::Divider).step(0.01_f32)
-    ]
-    .spacing(8)
-    .align_y(Center);
-    let navigator: Element<'_, Message> = if let Some(handle) = &state.viewport {
-        column![
-            text("NAVIGATOR").size(11),
-            canvas::Canvas::new(Navigator {
-                handle: handle.clone(),
-                zoom: state.zoom,
-                custom_zoom: state.custom_zoom,
-                pan: state.pan
-            })
-            .width(Length::Fixed(180.0))
-            .height(Length::Fixed(120.0)),
-            text("Drag the red frame to pan").size(10)
-        ]
-        .spacing(8)
-        .into()
-    } else {
-        column![text("NAVIGATOR").size(11)].into()
-    };
-    let history_panel: Element<'_, Message> = if let Some(index) = state.selected {
-        let entries = state.catalog.history(state.items[index].id);
-        let active = state.catalog.active_history_id(state.items[index].id);
-        let mut panel = column![text("HISTORY").size(11)].spacing(4);
-        for entry in entries {
-            panel = panel.push(
-                button(
-                    text(format!(
-                        "{}{}",
-                        if Some(entry.id) == active {
-                            "● "
-                        } else {
-                            "○ "
-                        },
-                        entry.label
-                    ))
-                    .size(10),
+
+    let filmstrip: Element<'_, Message> = {
+        let mut row_items = row![].spacing(6).align_y(Center);
+        for (i, it) in state.items.iter().enumerate() {
+            let is_sel = state.selected == Some(i);
+            let thumb: Element<'_, Message> = if let Some(h) = &state.thumbnails[i] {
+                image(h.clone())
+                    .content_fit(ContentFit::Cover)
+                    .width(Length::Fixed(84.0))
+                    .height(Length::Fixed(50.0))
+                    .into()
+            } else {
+                container(
+                    text("No Preview")
+                        .size(8)
+                        .color(Color::from_rgb8(150, 152, 156)),
                 )
-                .width(Length::Fill)
-                .on_press(Message::HistorySelect(entry.id)),
+                .width(Length::Fixed(84.0))
+                .height(Length::Fixed(50.0))
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .into()
+            };
+
+            row_items = row_items.push(
+                button(
+                    column![
+                        thumb,
+                        row![
+                            text(format!("#{}", i + 1))
+                                .size(8)
+                                .color(Color::from_rgb8(150, 152, 156)),
+                            Space::with_width(Length::Fixed(8.0)),
+                            text(format!("★{}", it.rating))
+                                .size(8)
+                                .color(Color::from_rgb8(255, 193, 116)),
+                        ]
+                        .width(Length::Fixed(84.0))
+                        .align_y(Center),
+                    ]
+                    .spacing(2)
+                    .align_x(Center),
+                )
+                .width(Length::Fixed(92.0))
+                .height(Length::Fixed(72.0))
+                .padding(3)
+                .style(if is_sel {
+                    button::secondary
+                } else {
+                    button::text
+                })
+                .on_press(Message::Select(i)),
             );
         }
-        panel.into()
-    } else {
-        column![text("HISTORY").size(11)].into()
-    };
-    let mut recent = row![].spacing(6).align_y(Center);
-    let recent_start = index.saturating_sub(4);
-    let recent_end = (index + 5).min(state.items.len());
-    for photo_index in recent_start..recent_end {
-        let item = &state.items[photo_index];
-        let thumb: Element<'_, Message> = if let Some(handle) = &state.thumbnails[photo_index] {
-            image(handle.clone())
-                .content_fit(ContentFit::Cover)
-                .width(Length::Fixed(88.0))
-                .height(Length::Fixed(52.0))
-                .into()
-        } else {
-            container(text("Preview").size(9))
-                .width(Length::Fixed(88.0))
-                .height(Length::Fixed(52.0))
-                .center(Length::Fill)
-                .into()
-        };
-        recent = recent.push(
-            button(column![
-                thumb,
-                text(format!("{}  ★{}", item.filename, item.rating)).size(9)
-            ])
-            .padding(4)
-            .style(if photo_index == index {
-                button::secondary
-            } else {
-                button::text
-            })
-            .on_press(Message::Select(photo_index)),
-        );
-    }
-    let recent_strip = container(column![text("RECENT PHOTOS").size(10), recent].spacing(5))
-        .padding(8)
+
+        container(
+            column![
+                row![
+                    text("FILMSTRIP DOCK").size(10).color(Color::from_rgb8(76, 215, 246)),
+                    Space::with_width(Length::Fill),
+                    text(format!("{} of {}", index + 1, state.items.len()))
+                        .size(9)
+                        .color(Color::from_rgb8(150, 152, 156)),
+                ]
+                .align_y(Center),
+                scrollable::Scrollable::with_direction(
+                    row_items.height(Length::Fixed(74.0)),
+                    scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
+                ),
+            ]
+            .spacing(4),
+        )
+        .padding(6)
         .width(Length::Fill)
-        .style(container::rounded_box);
-    let canvas = column![
-        zoom_controls,
-        divider,
+        .height(Length::Fixed(106.0))
+        .style(container::rounded_box)
+        .into()
+    };
+
+    let center_canvas = column![
+        center_toolbar,
         container(viewport)
             .width(Length::Fill)
             .height(Length::Fill)
-            .center(Length::Fill),
-        text(metadata).size(11).font(Font::MONOSPACE),
-        recent_strip
+            .center(Length::Fill)
+            .style(container::rounded_box),
+        text(exif_stamp).size(10).font(Font::MONOSPACE).color(Color::from_rgb8(170, 172, 176)),
+        filmstrip,
     ]
-    .spacing(8)
-    .align_x(Center);
-    row![
-        container(scrollable(column![navigator, history_panel].spacing(18)))
-            .width(Length::Fixed(250.0))
-            .padding([18, 12])
-            .style(container::rounded_box),
-        container(canvas)
-            .padding(18)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(container::rounded_box),
-        container(scrollable(controls.spacing(12)))
-            .padding(16)
-            .width(Length::Fixed(350.0))
-            .height(Length::Fill)
-            .style(container::rounded_box),
+    .spacing(6);
+
+    // ==========================================
+    // COLUMN 3: RIGHT DEVELOP INSPECTOR (350px)
+    // ==========================================
+    let mut controls = column![
+        row![
+            text("DEVELOP INSPECTOR").size(11).color(Color::from_rgb8(76, 215, 246)),
+            Space::with_width(Length::Fill),
+            text(&item.filename).size(10).font(Font::MONOSPACE),
+        ]
+        .align_y(Center),
     ]
-    .height(Length::Fill)
-    .into()
+    .spacing(8);
+
+    controls = controls.push(
+        histogram::view(state.histogram_data.clone(), state.clipping).map(|output| match output {
+            histogram::Output::Adjust(zone, delta) => Message::HistogramAdjust(zone, delta),
+            histogram::Output::ToggleClipping(idx) => Message::ToggleClipping(idx),
+        }),
+    );
+
+    if let Some(m) = meta {
+        controls = controls.push(
+            row![
+                container(text(format!("ISO {}", m.iso.map(|v| v.to_string()).unwrap_or_else(|| "—".into()))).size(9))
+                    .padding([2, 6])
+                    .style(container::rounded_box),
+                container(text(empty_dash(&m.shutter)).size(9))
+                    .padding([2, 6])
+                    .style(container::rounded_box),
+                container(text(empty_dash(&m.aperture)).size(9))
+                    .padding([2, 6])
+                    .style(container::rounded_box),
+                container(text(empty_dash(&m.lens)).size(9))
+                    .padding([2, 6])
+                    .style(container::rounded_box),
+            ]
+            .spacing(4),
+        );
+    }
+
+    controls = controls.push(
+        column![
+            text("AI MASKING (MOBILESAM)").size(10).color(Color::from_rgb8(76, 215, 246)),
+            row![
+                button(text(if state.mask_tool { "Cancel Point" } else { "Point Mask" }).size(10))
+                    .style(if state.mask_tool { button::secondary } else { button::text })
+                    .on_press(Message::MaskTool(!state.mask_tool)),
+                button(text("Sky").size(10)).style(button::text).on_press(Message::MaskPoint([0.5, 0.1])),
+                button(text("Subject").size(10)).style(button::text).on_press(Message::MaskPoint([0.5, 0.5])),
+                button(text("Clear").size(10)).style(button::text).on_press(Message::ClearMask),
+            ]
+            .spacing(4),
+        ]
+        .spacing(4),
+    );
+
+    controls = controls.push(
+        column![
+            row![
+                text("TONE CURVE").size(10).color(Color::from_rgb8(76, 215, 246)),
+                Space::with_width(Length::Fill),
+                button(text("RGB").size(9)).style(if state.curve_channel == 0 { button::secondary } else { button::text }).on_press(Message::CurveChannel(0)),
+                button(text("R").size(9)).style(if state.curve_channel == 1 { button::secondary } else { button::text }).on_press(Message::CurveChannel(1)),
+                button(text("G").size(9)).style(if state.curve_channel == 2 { button::secondary } else { button::text }).on_press(Message::CurveChannel(2)),
+                button(text("B").size(9)).style(if state.curve_channel == 3 { button::secondary } else { button::text }).on_press(Message::CurveChannel(3)),
+            ]
+            .spacing(2)
+            .align_y(Center),
+            widgets::tone_curve::view(state.curve_points[state.curve_channel].clone())
+                .map(|p| Message::CurvePoint(p.0, p.1)),
+        ]
+        .spacing(4),
+    );
+
+    controls = controls.push(
+        column![
+            text("3-WAY COLOR GRADING").size(10).color(Color::from_rgb8(76, 215, 246)),
+            row![
+                column![
+                    text("Shadows").size(9),
+                    widgets::color_wheel::view(state.wheel_values[0].0, state.wheel_values[0].1)
+                        .map(|v| Message::Wheel(0, v.0, v.1)),
+                    slider(-1.0..=1.0, state.wheel_values[0].2, |v| Message::WheelLuma(0, v)).step(0.02_f32),
+                ]
+                .align_x(Center)
+                .spacing(3),
+                column![
+                    text("Midtones").size(9),
+                    widgets::color_wheel::view(state.wheel_values[1].0, state.wheel_values[1].1)
+                        .map(|v| Message::Wheel(1, v.0, v.1)),
+                    slider(-1.0..=1.0, state.wheel_values[1].2, |v| Message::WheelLuma(1, v)).step(0.02_f32),
+                ]
+                .align_x(Center)
+                .spacing(3),
+                column![
+                    text("Highlights").size(9),
+                    widgets::color_wheel::view(state.wheel_values[2].0, state.wheel_values[2].1)
+                        .map(|v| Message::Wheel(2, v.0, v.1)),
+                    slider(-1.0..=1.0, state.wheel_values[2].2, |v| Message::WheelLuma(2, v)).step(0.02_f32),
+                ]
+                .align_x(Center)
+                .spacing(3),
+            ]
+            .spacing(8),
+        ]
+        .spacing(4),
+    );
+
+    controls = controls.push(
+        column![
+            text("BASIC CALIBRATION").size(10).color(Color::from_rgb8(76, 215, 246)),
+            control("Temperature", state.params.temperature, 2000.0..=50000.0, 25.0, Message::Temperature),
+            control("Tint", state.params.tint, -150.0..=150.0, 1.0, Message::Tint),
+        ]
+        .spacing(2),
+    );
+
+    controls = controls.push(
+        column![
+            text("TONE DISTRIBUTION").size(10).color(Color::from_rgb8(76, 215, 246)),
+            control("Exposure", state.params.exposure, -5.0..=5.0, 0.05, Message::Exposure),
+            control("Contrast", state.params.contrast, -100.0..=100.0, 1.0, Message::Contrast),
+            control("Highlights", state.params.highlights, -100.0..=100.0, 1.0, Message::Highlights),
+            control("Shadows", state.params.shadows, -100.0..=100.0, 1.0, Message::Shadows),
+            control("Whites", state.params.whites, -100.0..=100.0, 1.0, Message::Whites),
+            control("Blacks", state.params.blacks, -100.0..=100.0, 1.0, Message::Blacks),
+        ]
+        .spacing(2),
+    );
+
+    controls = controls.push(
+        row![
+            text("Rating:").size(10),
+            button(text("1").size(9)).style(button::text).on_press(Message::Rating(1)),
+            button(text("2").size(9)).style(button::text).on_press(Message::Rating(2)),
+            button(text("3").size(9)).style(button::text).on_press(Message::Rating(3)),
+            button(text("4").size(9)).style(button::text).on_press(Message::Rating(4)),
+            button(text("5").size(9)).style(button::text).on_press(Message::Rating(5)),
+            Space::with_width(Length::Fill),
+            button(text("Pick").size(9)).style(button::text).on_press(Message::Flag("Pick")),
+            button(text("Reject").size(9)).style(button::text).on_press(Message::Flag("Reject")),
+        ]
+        .spacing(2)
+        .align_y(Center),
+    );
+
+    controls = controls.push(
+        row![
+            button(text("Reset").size(11))
+                .style(button::text)
+                .on_press(Message::Reset),
+            Space::with_width(Length::Fill),
+            button(text("Save Edits").size(11))
+                .style(button::primary)
+                .on_press(Message::Save),
+        ]
+        .align_y(Center),
+    );
+
+    let right_inspector = container(scrollable(controls.spacing(10)))
+        .width(Length::Fixed(350.0))
+        .padding(12)
+        .style(container::rounded_box);
+
+    row![left_deck, center_canvas, right_inspector]
+        .spacing(6)
+        .height(Length::Fill)
+        .into()
 }
 
 fn control(
@@ -1730,6 +2061,7 @@ fn control(
     scrubby_slider::view(label, value, min, max, default, step, gradient)
         .map(move |SliderOutput::Changed(value)| on_change(value))
 }
+
 fn empty_dash(s: &str) -> &str {
     if s.is_empty() {
         "—"
@@ -1820,7 +2152,7 @@ impl canvas::Program<Message> for MainViewport {
                     return (canvas::event::Status::Ignored, None);
                 }
                 state.dragging = true;
-                state.last = cursor.position_in(bounds);
+                state.last = cursor.position();
                 (canvas::event::Status::Captured, None)
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(
@@ -1866,6 +2198,12 @@ impl canvas::Program<Message> for MainViewport {
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
+        frame.fill_rectangle(
+            Point::ORIGIN,
+            bounds.size(),
+            Color::from_rgb8(35, 36, 39),
+        );
+
         let size = self.display_size(bounds.size());
         let x = if size.width > bounds.width {
             -(size.width - bounds.width) * self.pan[0]
@@ -1903,15 +2241,20 @@ impl canvas::Program<Message> for MainViewport {
     fn mouse_interaction(
         &self,
         state: &Self::State,
-        _bounds: Rectangle,
+        bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
         if state.dragging {
             mouse::Interaction::Grabbing
         } else if self.mask_tool {
             mouse::Interaction::Crosshair
-        } else {
+        } else if {
+            let size = self.display_size(bounds.size());
+            size.width > bounds.width || size.height > bounds.height
+        } {
             mouse::Interaction::Grab
+        } else {
+            mouse::Interaction::Idle
         }
     }
 }
@@ -1936,21 +2279,29 @@ impl canvas::Program<Message> for Navigator {
         match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 state.dragging = true;
-                let p = cursor
-                    .position_in(bounds)
-                    .unwrap_or(Point::new(bounds.width / 2.0, bounds.height / 2.0));
+                if let Some(p) = cursor.position_in(bounds) {
+                    (
+                        canvas::event::Status::Captured,
+                        Some(Message::PanTo(
+                            (p.x / bounds.width).clamp(0.0, 1.0),
+                            (p.y / bounds.height).clamp(0.0, 1.0),
+                        )),
+                    )
+                } else {
+                    (canvas::event::Status::Ignored, None)
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+                let x = (position.x - bounds.x).clamp(0.0, bounds.width);
+                let y = (position.y - bounds.y).clamp(0.0, bounds.height);
                 (
                     canvas::event::Status::Captured,
-                    Some(Message::PanTo(p.x / bounds.width, p.y / bounds.height)),
+                    Some(Message::PanTo(
+                        (x / bounds.width).clamp(0.0, 1.0),
+                        (y / bounds.height).clamp(0.0, 1.0),
+                    )),
                 )
             }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => (
-                canvas::event::Status::Captured,
-                Some(Message::PanTo(
-                    position.x / bounds.width,
-                    position.y / bounds.height,
-                )),
-            ),
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
                 (canvas::event::Status::Captured, None)
@@ -1983,15 +2334,15 @@ impl canvas::Program<Message> for Navigator {
             ZoomMode::Four => 0.09,
             ZoomMode::Custom => (1.0 / self.custom_zoom.max(1.0)).max(0.09),
         };
-        let width = (bounds.width * visible).max(24.0).min(bounds.width);
-        let height = (bounds.height * visible).max(18.0).min(bounds.height);
+        let width = (bounds.width * visible).max(20.0).min(bounds.width);
+        let height = (bounds.height * visible).max(14.0).min(bounds.height);
         let x = (bounds.width - width) * self.pan[0];
         let y = (bounds.height - height) * self.pan[1];
         frame.stroke_rectangle(
             Point::new(x, y),
             Size::new(width, height),
             canvas::Stroke::default()
-                .with_color(Color::from_rgb(1.0, 0.18, 0.12))
+                .with_color(Color::from_rgb8(76, 215, 246))
                 .with_width(2.0),
         );
         vec![frame.into_geometry()]

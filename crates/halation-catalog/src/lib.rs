@@ -1,6 +1,7 @@
 use halation_core::DevelopParameters;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -65,6 +66,12 @@ impl Catalog {
                 params_json TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_history_asset ON develop_history(asset_id,id);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS culling_metrics (
+            asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+            sharpness REAL NOT NULL,
+            clipped_highlights REAL NOT NULL,
+            analyzed_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );")?;
         // Existing catalogs predate the history head pointer.
         let _ = conn.execute(
             "ALTER TABLE develop_states ADD COLUMN active_history_id INTEGER",
@@ -102,6 +109,36 @@ impl Catalog {
             return Vec::new();
         };
         rows.filter_map(Result::ok).collect()
+    }
+
+    pub fn load_culling_metrics(&self) -> HashMap<u64, (f32, f32)> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT asset_id, sharpness, clipped_highlights FROM culling_metrics",
+        ) else {
+            return HashMap::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, f64>(1)? as f32,
+                row.get::<_, f64>(2)? as f32,
+            ))
+        }) else {
+            return HashMap::new();
+        };
+        rows.filter_map(Result::ok)
+            .map(|(id, sharpness, clipped)| (id, (sharpness, clipped)))
+            .collect()
+    }
+
+    pub fn save_culling_metrics(&self, id: u64, sharpness: f32, clipped_highlights: f32) {
+        let _ = self.conn.lock().unwrap().execute(
+            "INSERT INTO culling_metrics(asset_id, sharpness, clipped_highlights) VALUES(?1,?2,?3)
+             ON CONFLICT(asset_id) DO UPDATE SET sharpness=excluded.sharpness,
+             clipped_highlights=excluded.clipped_highlights, analyzed_at=strftime('%s','now')",
+            params![id as i64, sharpness, clipped_highlights],
+        );
     }
 
     pub fn import_asset(
@@ -350,6 +387,12 @@ fn history_label(old: &DevelopParameters, new: &DevelopParameters) -> Option<Str
         if (before - after).abs() > 0.0001 {
             changes.push(format!("{name} {after:+.2}{suffix}"));
         }
+    }
+    if old.tone_curve != new.tone_curve {
+        changes.push("Tone Curve".into());
+    }
+    if old.color_grading != new.color_grading {
+        changes.push("Color Grading".into());
     }
     (!changes.is_empty()).then(|| changes.join(" | "))
 }

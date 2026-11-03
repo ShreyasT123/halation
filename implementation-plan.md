@@ -250,7 +250,7 @@ SCRUBBY SLIDER SPECIFICATION:
 
 ### 6.1 Tasks & Deliverables
 
-*   [ ] **Virtualized Grid & Filmstrip Widget (`halation-ui`):**
+*   [x] **Virtualized Grid & Filmstrip Widget (`halation-ui`):**
     *   Virtual scrolling grid rendering only visible items $+ 2$ row buffer.
     *   Keyboard navigation: Arrow keys to move selection, `1`–`5` for star ratings, `6`–`9` for color labels, `Z`/`X`/`U` for Pick/Reject/Unflag.
     *   Badges on thumbnails: Rating stars, pick flag icon, file format chip (`RAW`, `DNG`, `JPG`).
@@ -258,12 +258,15 @@ SCRUBBY SLIDER SPECIFICATION:
     *   Tier 1 (Memory): 500-item LRU cache of decoded $256\text{ px}$ micro-thumbnails.
     *   Tier 2 (Disk): Fast WebP/LZ4 thumbnails stored in `.halation/cache/` keyed by `blake3` file hashes.
     *   Background Rayon workers asynchronously decode and downscale previews without dropping grid scroll frames.
+    *   Current code uses a 500-entry memory LRU and WebP disk cache keyed by path, file size, and modification time; the full-content hash remains intentionally out of the hot thumbnail path.
 *   [ ] **Local Assisted Culling Engine (`halation-pipeline`):**
     *   Local multi-threaded analysis pass (zero network requests):
         *   Subject Sharpness: High-frequency Laplacian gradient variance.
         *   Eye State / Blink Detection: Eye Aspect Ratio (EAR) metric identifying closed eyes.
         *   Technical Rejects: Detection of severe camera motion shake or blown highlights.
     *   UI badges: `Select` (Green) and `Reject` (Red) with real-time threshold filter sliders.
+    *   Current code computes Laplacian sharpness and highlight clipping, persists those metrics in SQLite, and updates per-photo status badges from the live thresholds. Eye/blink and camera-motion detection remain unimplemented.
+    *   The Library's `Filter Selects` toggle filters cards and keyboard navigation using the current sharpness and clipping thresholds.
 
 ### 6.2 Definition of Done (DoD)
 * Smooth, locked 60–120 FPS scrolling across a catalog of 10,000+ RAW images.

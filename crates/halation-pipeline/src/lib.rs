@@ -9,8 +9,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Small WebP preview cache. The memory tier is bounded; disk files are keyed
-/// by the source file's BLAKE3 digest and can be safely discarded at any time.
 pub struct ThumbnailCache {
     root: PathBuf,
     capacity: usize,
@@ -27,10 +25,19 @@ impl ThumbnailCache {
     }
 
     pub fn get_or_create(&self, source: &Path) -> Result<Arc<Vec<u8>>, String> {
-        let mut source_file = std::fs::File::open(source).map_err(|e| e.to_string())?;
+        let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut source_file, &mut hasher).map_err(|e| e.to_string())?;
+        hasher.update(source.to_string_lossy().as_bytes());
+        hasher.update(&metadata.len().to_le_bytes());
+        hasher.update(&mtime.to_le_bytes());
         let key = *hasher.finalize().as_bytes();
+
         {
             let mut cache = self.memory.lock().map_err(|e| e.to_string())?;
             if let Some(value) = cache.0.get(&key).cloned() {
@@ -72,14 +79,10 @@ impl ThumbnailCache {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CullingMetrics {
-    /// Variance of the grayscale Laplacian; larger values usually indicate focus.
     pub sharpness: f32,
-    /// Fraction of pixels with any channel at or above 0.995 linear white.
     pub clipped_highlights: f32,
 }
 
-/// Fast local technical-quality metrics. Eye-state analysis requires a face
-/// landmark model and is intentionally not inferred from these image metrics.
 pub fn analyze_for_culling(raw: &RawAsset) -> CullingMetrics {
     let width = raw.buffer.width as usize;
     let height = raw.buffer.height as usize;
@@ -131,8 +134,6 @@ pub struct ExportJob {
     pub params: DevelopParameters,
 }
 
-/// Decode, develop, and encode a batch on Rayon workers. Each file is isolated:
-/// one corrupt source does not cancel the rest of the queue.
 pub fn export_batch(jobs: &[ExportJob], format: ExportFormat) -> Vec<Result<PathBuf, String>> {
     jobs.par_iter()
         .map(|job| {
@@ -183,31 +184,40 @@ pub fn process_frame_with_gpu(
     }
     let exp_mult = 2.0_f32.powf(params.exposure);
     let white_balance = halation_color::white_balance_matrix(params.temperature, params.tint);
+
+    let prepared_curves: [halation_color::PreparedCurve; 4] = if params.tone_curve.len() >= 20 {
+        std::array::from_fn(|i| {
+            halation_color::PreparedCurve::new(&params.tone_curve[i * 5..i * 5 + 5])
+        })
+    } else {
+        std::array::from_fn(|_| halation_color::PreparedCurve::new(&[]))
+    };
+    let wheel_tints = halation_color::calculate_wheel_tints(&params.color_grading);
     let pixels = &raw.buffer.pixels;
 
-    // 1. Multithreaded parallel pixel processing using Rayon
     let processed_pixels: Vec<[u8; 3]> = pixels
         .par_iter()
         .map(|rgb| {
-            // Exposure
             let mut c = [rgb[0] * exp_mult, rgb[1] * exp_mult, rgb[2] * exp_mult];
-            // White Balance
             c = halation_color::apply_matrix(white_balance, c);
-            // Highlights & Shadows
             c = halation_color::apply_highlights_shadows(c, params.highlights, params.shadows);
             c = halation_color::apply_whites_blacks(c, params.whites, params.blacks);
-            // Contrast
             c = halation_color::apply_contrast(c, params.contrast);
+            c = halation_color::apply_curves_and_color_grading(
+                c,
+                &prepared_curves,
+                &wheel_tints,
+                &params.color_grading,
+            );
 
             [
-                (c[0] * 255.0) as u8,
-                (c[1] * 255.0) as u8,
-                (c[2] * 255.0) as u8,
+                (c[0] * 255.0).round() as u8,
+                (c[1] * 255.0).round() as u8,
+                (c[2] * 255.0).round() as u8,
             ]
         })
         .collect();
 
-    // 2. Build 8-bit display buffer & compute 256-bin Histogram
     let mut display_rgba = Vec::with_capacity(processed_pixels.len() * 4);
     let mut histogram = HistogramData::default();
 
@@ -250,8 +260,7 @@ fn finish_frame_with_histogram(
 }
 
 fn render_histogram_bitmap(hist: &HistogramData, width: u32, height: u32) -> Vec<u8> {
-    let mut bmp = vec![25; (width * height * 4) as usize]; // dark grey background
-
+    let mut bmp = vec![25; (width * height * 4) as usize];
     let max_count = hist
         .r
         .iter()
