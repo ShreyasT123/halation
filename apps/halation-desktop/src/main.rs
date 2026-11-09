@@ -9,6 +9,6 @@ fn main() -> iced::Result {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    info!("Starting Halation Desktop (Windows Engine)...");
+    info!("Starting Halation Desktop (Windows)...");
     halation_ui::run()
 }

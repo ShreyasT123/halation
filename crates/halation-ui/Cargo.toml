@@ -12,5 +12,6 @@ halation-pipeline = { workspace = true }
 halation-catalog = { workspace = true }
 halation-ml = { workspace = true }
 iced = { workspace = true }
+iced_font_awesome = { workspace = true }
 rfd = { workspace = true }
 tokio = { workspace = true }

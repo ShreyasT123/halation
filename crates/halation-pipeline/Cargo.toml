@@ -10,4 +10,6 @@ halation-raw = { workspace = true }
 halation-gpu = { workspace = true }
 rayon = { workspace = true }
 image = { workspace = true }
-blake3 = { workspace = true }
+ab_glyph = { workspace = true }
+lru = { workspace = true }
+lz4_flex = { workspace = true }

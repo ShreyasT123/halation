@@ -1,0 +1,16 @@
+﻿[package]
+name = "halation-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+halation-color = { workspace = true }
+halation-raw = { workspace = true }
+halation-gpu = { workspace = true }
+halation-pipeline = { workspace = true }
+halation-catalog = { workspace = true }
+halation-ml = { workspace = true }
+iced = { workspace = true }
+rfd = { workspace = true }
+tokio = { workspace = true }

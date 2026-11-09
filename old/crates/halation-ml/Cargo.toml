@@ -1,0 +1,9 @@
+[package]
+name = "halation-ml"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+halation-core = { workspace = true }
+thiserror = { workspace = true }
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["directml", "download-binaries", "copy-dylibs"] }

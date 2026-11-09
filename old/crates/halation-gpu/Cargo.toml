@@ -1,0 +1,10 @@
+[package]
+name = "halation-gpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+halation-core = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }

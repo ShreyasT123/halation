@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-image = { workspace = true }
+halation-core = { workspace = true }
+thiserror = { workspace = true }
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["directml", "download-binaries", "copy-dylibs"] }

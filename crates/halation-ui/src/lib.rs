@@ -1,54 +1,208 @@
+//! halation-ui — Halation darkroom shell (Iced 0.13).
+//!
+//! ```text
+//! ┌ top bar ────────────────────────────────────────────────────────────┐
+//! │ left 260  │ loupe canvas · toolbar · EXIF HUD            │ right 320 │
+//! │ navigator │                                              │ histogram │
+//! │ history   │                                              │ tool rail │
+//! │ snapshots │                                              │ accordion │
+//! │ folders   │                                              │           │
+//! ├───────────┴──────────────────────────────────────────────┴───────────┤
+//! │ filmstrip 110                                                        │
+//! └ status bar ─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Decode, thumbnails and develop renders all run off the UI thread. Renders are coalesced
+//! (latest-wins, at most one in flight), so dragging a slider never queues frames behind itself.
+//!
+//! Needs iced features `image` plus an executor (`tokio` or `thread-pool`).
+//!
+//! Keymap: Tab / Shift+Tab / `/` toggle left / right / filmstrip · Z zoom · `\` before/after ·
+//! ←/→ previous/next · 0–5 rating · P/X/U pick/reject/clear · Ctrl/Cmd+Z, +Shift+Z undo/redo ·
+//! Ctrl/Cmd+O import.
+
+mod ext;
+mod grid;
+mod tools;
+mod viewport;
+mod widgets;
+
+use ext::{ExtMessage, ExtState};
+use grid::{GridMessage, HandleCache};
 use halation_catalog::{Catalog, CatalogItem};
-use halation_core::{DevelopParameters, HistogramData, ImageBufferF32};
+use halation_core::{DevelopParameters, HistogramData, HistoryGraph, ImageBufferF32, ParamId, Wheel};
 use halation_gpu::{GpuDevelopEngine, GpuEngineInfo};
-use halation_ml::{Mask, MobileSam};
-use halation_pipeline::{
-    analyze_for_culling, export_batch, process_frame_with_gpu, CullingMetrics, ExportFormat,
-    ExportJob, ThumbnailCache,
-};
-use halation_raw::{decode_file, RawAsset};
+use halation_pipeline::{make_preview, process_with_context, RenderContext, HISTOGRAM_HEIGHT, HISTOGRAM_WIDTH};
+use halation_raw::{decode_file, decode_thumbnail, read_metadata, RawMetadata, SUPPORTED_EXTENSIONS};
+use viewport::{Compare, Navigator, ViewEvent, Viewport};
+use widgets::{CurveEdit, HistogramView, Scrubby, WheelId};
 use iced::{
-    event,
-    font::Font,
-    keyboard, mouse,
-    theme::Palette,
-    widget::{button, canvas, column, container, image, row, scrollable, slider, text, Space},
-    Center, Color, ContentFit, Element, Event, Length, Point, Rectangle, Size, Subscription, Task,
-    Theme,
+    alignment::{Horizontal, Vertical},
+    keyboard::{self, key::Named, Key},
+    widget::{button, column, container, image, mouse_area, row, scrollable, slider, stack, text, Column, Row, Space, Text},
+    Background, Border, Color, ContentFit, Element, Font, Length, Padding, Shadow, Size, Subscription, Task, Theme,
 };
 use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
-mod widgets;
-use widgets::{
-    histogram,
-    scrubby_slider::{self, Gradient, Output as SliderOutput},
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
-const PREVIEW_MAX: u32 = 1200;
+const PREVIEW_MAX: u32 = 2048;
+const THUMB_MAX: u32 = 192;
+const LEFT_W: f32 = 260.0;
+const RIGHT_W: f32 = 320.0;
+const FILMSTRIP_H: f32 = 110.0;
+const RADIUS: f32 = 3.0;
 
-pub fn run() -> iced::Result {
-    iced::application("Halation | Pro Color grading", update, view)
-        .theme(|_| {
-            Theme::custom(
-                "Halation Studio Dark".into(),
-                Palette {
-                    background: Color::from_rgb8(35, 36, 39),       // #232427
-                    text: Color::from_rgb8(227, 226, 228),          // #e3e2e4
-                    primary: Color::from_rgb8(255, 193, 116),       // Amber #ffc174
-                    success: Color::from_rgb8(76, 215, 246),       // Cyan #4cd7f6
-                    danger: Color::from_rgb8(255, 180, 171),        // Salmon #ffb4ab
-                },
-            )
-        })
-        .default_font(Font::with_name("Segoe UI"))
-        .window_size(Size::new(1000.0, 600.0))
-        .centered()
-        .subscription(subscription)
-        .run()
+// ------------------------------------------------------------------------------------------------
+// Palette & styles
+// ------------------------------------------------------------------------------------------------
+
+const fn hex(v: u32) -> Color {
+    Color {
+        r: ((v >> 16) & 0xFF) as f32 / 255.0,
+        g: ((v >> 8) & 0xFF) as f32 / 255.0,
+        b: (v & 0xFF) as f32 / 255.0,
+        a: 1.0,
+    }
 }
+
+const BG_APP: Color = hex(0x121212);
+const BG_PANEL: Color = hex(0x181818);
+const BG_HEADER: Color = hex(0x222222);
+const BG_INPUT: Color = hex(0x282828);
+const BG_CANVAS: Color = hex(0x161616);
+const BG_HOVER: Color = hex(0x2A2A2A);
+const BG_SELECTED: Color = hex(0x1F2E44);
+const BORDER: Color = hex(0x2C2C2C);
+const TEXT_PRIMARY: Color = hex(0xE0E0E0);
+const TEXT_HEADING: Color = hex(0xD4D4D4);
+const TEXT_SECONDARY: Color = hex(0xA0A0A0);
+const TEXT_DIM: Color = hex(0x6E6E6E);
+const ACCENT: Color = hex(0x2680EB);
+const PICK: Color = hex(0x46A758);
+const REJECT: Color = hex(0xE5484D);
+const STAR: Color = hex(0xF2C14E);
+const CLIP_SHADOW: Color = hex(0x2255FF);
+const CLIP_HIGHLIGHT: Color = hex(0xFF2222);
+
+fn darkroom_theme() -> Theme {
+    Theme::custom(
+        "Halation".to_string(),
+        iced::theme::Palette { background: BG_APP, text: TEXT_PRIMARY, primary: ACCENT, success: PICK, danger: REJECT },
+    )
+}
+
+fn solid(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style { background: Some(Background::Color(color)), ..container::Style::default() }
+}
+
+fn framed(color: Color, border: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(color)),
+        border: Border { color: border, width: 1.0, radius: RADIUS.into() },
+        ..container::Style::default()
+    }
+}
+
+fn button_style(active: bool, accent: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let (bg, fg, border) = match status {
+            button::Status::Active => (
+                active.then_some(Color { a: 0.20, ..accent }),
+                if active { TEXT_PRIMARY } else { TEXT_SECONDARY },
+                if active { accent } else { BORDER },
+            ),
+            button::Status::Hovered => (Some(BG_HOVER), TEXT_PRIMARY, if active { accent } else { TEXT_DIM }),
+            button::Status::Pressed => (Some(BG_INPUT), TEXT_PRIMARY, accent),
+            button::Status::Disabled => (None, TEXT_DIM, BORDER),
+        };
+        button::Style {
+            background: bg.map(Background::Color),
+            text_color: fg,
+            border: Border { color: border, width: 1.0, radius: RADIUS.into() },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+fn row_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: match (active, status) {
+            (true, _) => Some(Background::Color(BG_SELECTED)),
+            (false, button::Status::Hovered) => Some(Background::Color(BG_HOVER)),
+            _ => None,
+        },
+        text_color: if active { TEXT_PRIMARY } else { TEXT_SECONDARY },
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: RADIUS.into() },
+        shadow: Shadow::default(),
+    }
+}
+
+fn tile_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| button::Style {
+        background: Some(Background::Color(if status == button::Status::Hovered { BG_HOVER } else { BG_PANEL })),
+        text_color: TEXT_SECONDARY,
+        border: Border { color: if selected { ACCENT } else { BORDER }, width: if selected { 2.0 } else { 1.0 }, radius: RADIUS.into() },
+        shadow: Shadow::default(),
+    }
+}
+
+fn slider_style(modified: bool) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_, status| {
+        let thumb = match status {
+            slider::Status::Active => if modified { ACCENT } else { TEXT_SECONDARY },
+            slider::Status::Hovered => TEXT_PRIMARY,
+            slider::Status::Dragged => hex(0x5AA2F5),
+        };
+        slider::Style {
+            rail: slider::Rail {
+                backgrounds: (Background::Color(if modified { ACCENT } else { hex(0x4A4A4A) }), Background::Color(BG_INPUT)),
+                width: 2.0,
+                border: Border { radius: 1.0.into(), ..Border::default() },
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Circle { radius: 6.0 },
+                background: Background::Color(thumb),
+                border_width: 0.0,
+                border_color: Color::TRANSPARENT,
+            },
+        }
+    }
+}
+
+fn label(s: impl Into<String>, size: u16, color: Color) -> Text<'static> {
+    text(s.into()).size(size).color(color)
+}
+
+fn mono(s: impl Into<String>, size: u16, color: Color) -> Text<'static> {
+    label(s, size, color).font(Font::MONOSPACE)
+}
+
+fn fa(name: &str, size: f32, color: Color) -> Element<'static, Message> {
+    iced_font_awesome::fa_icon_solid::<Theme>(name).size(size).color(color).into()
+}
+
+fn fa_regular(name: &str, size: f32, color: Color) -> Element<'static, Message> {
+    iced_font_awesome::fa_icon::<Theme>(name).size(size).color(color).into()
+}
+
+fn v_rule() -> Element<'static, Message> {
+    container(Space::new(Length::Fixed(1.0), Length::Fill)).height(Length::Fill).style(solid(BORDER)).into()
+}
+
+fn h_rule() -> Element<'static, Message> {
+    container(Space::new(Length::Fill, Length::Fixed(1.0))).width(Length::Fill).style(solid(BORDER)).into()
+}
+
+fn chip(s: &'static str, color: Color) -> Element<'static, Message> {
+    container(label(s, 9, hex(0x101010))).padding([0, 4]).style(solid(color)).into()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Types
+// ------------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -61,8 +215,7 @@ pub enum ZoomMode {
     Fit,
     Fill,
     Actual,
-    Two,
-    Four,
+    /// Wheel / pinch zoom: the exact scale lives in the view transform.
     Custom,
 }
 
@@ -71,63 +224,176 @@ pub enum ViewMode {
     Single,
     SplitSideBySide,
     SplitTopBottom,
+    Wipe,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Left,
+    Right,
+    Filmstrip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    WhiteBalance,
+    Tone,
+    Presence,
+}
+
+impl Section {
+    const ALL: [Section; 3] = [Section::WhiteBalance, Section::Tone, Section::Presence];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Section::WhiteBalance => "White Balance",
+            Section::Tone => "Tone",
+            Section::Presence => "Presence",
+        }
+    }
+    fn ids(self) -> &'static [ParamId] {
+        match self {
+            Section::WhiteBalance => &ParamId::WHITE_BALANCE,
+            Section::Tone => &ParamId::TONE,
+            Section::Presence => &ParamId::PRESENCE,
+        }
+    }
+}
+
+/// A photo opened in Develop: metadata plus the working-space preview every render starts from.
+#[derive(Debug)]
+pub struct Document {
+    id: u64,
+    filename: String,
+    metadata: RawMetadata,
+    full_size: (u32, u32),
+    preview: Arc<ImageBufferF32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadError {
+    id: u64,
+    message: String,
+}
+
+#[derive(Debug)]
+pub struct RenderResult {
+    doc_id: u64,
+    display: image::Handle,
+    histogram: HistogramData,
+    histogram_bitmap: image::Handle,
+    original: Option<image::Handle>,
+    used_gpu: bool,
+    millis: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImportReport {
+    first_id: Option<u64>,
+    imported: usize,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Noop,
+    Navigate(Page),
+    ImportDialog,
+    FolderDialog,
+    Picked(Vec<PathBuf>),
+    Imported(ImportReport),
+    Select(usize),
+    Step(i32),
+    Opened(Result<Arc<Document>, LoadError>),
+    Rendered(Arc<RenderResult>),
+    Thumbnail(u64, Option<image::Handle>),
+    Param(ParamId, f32),
+    CommitEdit,
+    ResetParam(ParamId),
+    ResetSection(Section),
+    ResetAll,
+    Undo,
+    Redo,
+    HistoryCheckout(usize),
+    SnapshotAdd,
+    SnapshotApply(usize),
+    ToggleSection(Section),
+    TogglePanel(Panel),
+    FolderFilter(Option<PathBuf>),
+    Rating(u8),
+    Flag(&'static str),
+    SetZoom(ZoomMode),
+    ToggleZoom,
+    SetViewMode(ViewMode),
+    ToggleComparison,
+    Divider(f32),
+    /// Hold `\` to peek at the baseline.
+    Peek(bool),
+    View(ViewEvent),
+    Curve(CurveEdit),
+    Wheel(WheelId, Wheel),
+    ToggleClipping,
+    Ext(ExtMessage),
+}
+
+// ------------------------------------------------------------------------------------------------
+// State
+// ------------------------------------------------------------------------------------------------
 
 pub struct State {
     catalog: Catalog,
     items: Vec<CatalogItem>,
-    thumbnail_cache: Arc<ThumbnailCache>,
-    thumbnails: Vec<Option<image::Handle>>,
-    thumbnail_requested: HashSet<usize>,
-    culling_metrics: Vec<Option<CullingMetrics>>,
-    exporting: bool,
-    sharpness_threshold: f32,
-    clipping_threshold: f32,
-    filter_culling: bool,
-    ml: Arc<Mutex<Option<MobileSam>>>,
-    mask_overlay: Option<image::Handle>,
-    mask_tool: bool,
-    mask_generation: u64,
-    raw_assets: Vec<Option<RawAsset>>,
+    thumbs: HandleCache,
+    thumb_failed: HashSet<u64>,
+    thumb_pending: bool,
     selected: Option<usize>,
+    loading: Option<u64>,
+    doc: Option<Arc<Document>>,
     page: Page,
     params: DevelopParameters,
-    curve_points: [Vec<[f32; 2]>; 4],
-    curve_channel: usize,
-    wheel_values: [(f32, f32, f32); 3],
-    clipping: [bool; 2],
-    preview_dirty: bool,
-    preview_scheduled: bool,
-    loading_photo: bool,
-    load_generation: u64,
-    xmp_generation: u64,
-    catalog_scroll_y: f32,
-    catalog_view_height: f32,
-    catalog_view_width: f32,
-    catalog_scroll_id: scrollable::Id,
+    history: HistoryGraph,
+    snapshots: Vec<(String, DevelopParameters)>,
     viewport: Option<image::Handle>,
-    histogram: Option<image::Handle>,
-    histogram_data: Option<HistogramData>,
+    original: Option<image::Handle>,
+    original_for: Option<u64>,
+    histogram: Option<HistogramData>,
+    histogram_bitmap: Option<image::Handle>,
+    render_in_flight: bool,
+    render_dirty: bool,
+    render_ms: f32,
+    used_gpu: bool,
     gpu: GpuEngineInfo,
-    gpu_engine: Option<GpuDevelopEngine>,
-    original_viewport: Option<image::Handle>,
-    original_asset_index: Option<usize>,
+    gpu_engine: Option<Arc<GpuDevelopEngine>>,
     zoom: ZoomMode,
     view_mode: ViewMode,
     divider: f32,
-    pan: [f32; 2],
-    custom_zoom: f32,
-    preview_dimensions: (u32, u32),
+    left_open: bool,
+    right_open: bool,
+    filmstrip_open: bool,
+    sections: [bool; 3],
+    folder_filter: Option<PathBuf>,
+    theme: Theme,
     status: String,
+    ext: ExtState,
 }
 
 impl Default for State {
     fn default() -> Self {
-        let catalog_path = std::env::var_os("LOCALAPPDATA")
+        Self::new()
+    }
+}
+
+impl State {
+    fn new() -> Self {
+        let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Halation")
-            .join("catalog.halation-cat");
+            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .unwrap_or_else(std::env::temp_dir);
+        let catalog_path = base.join("Halation").join("catalog.halation-cat");
         if let Some(parent) = catalog_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -135,2229 +401,1170 @@ impl Default for State {
             .or_else(|_| Catalog::open_in_memory())
             .expect("catalog initialization failed");
         let items = catalog.load_items();
-        let stored_culling = catalog.load_culling_metrics();
-        let culling_metrics = items
-            .iter()
-            .map(|item| {
-                stored_culling
-                    .get(&item.id)
-                    .map(|(sharpness, clipped_highlights)| CullingMetrics {
-                        sharpness: *sharpness,
-                        clipped_highlights: *clipped_highlights,
-                    })
-            })
-            .collect();
-        let count = items.len();
-        let cache_root = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Halation")
-            .join("cache");
-        let gpu_engine = GpuDevelopEngine::new().ok();
-        let gpu = gpu_engine
-            .as_ref()
-            .map(|engine| engine.info().clone())
-            .unwrap_or_else(GpuEngineInfo::fallback);
+        let gpu_engine = GpuDevelopEngine::new().ok().map(Arc::new);
+        let gpu = gpu_engine.as_ref().map(|e| e.info().clone()).unwrap_or_else(GpuEngineInfo::fallback);
+        let status = format!("{} photos in catalog", items.len());
         Self {
             catalog,
-            raw_assets: vec![None; count],
             items,
-            thumbnail_cache: Arc::new(ThumbnailCache::new(cache_root)),
-            thumbnails: vec![None; count],
-            thumbnail_requested: HashSet::new(),
-            culling_metrics,
-            exporting: false,
-            sharpness_threshold: 0.001,
-            clipping_threshold: 0.03,
-            filter_culling: false,
-            ml: Arc::new(Mutex::new(None)),
-            mask_overlay: None,
-            mask_tool: false,
-            mask_generation: 0,
+            thumbs: HandleCache::new(800),
+            thumb_failed: HashSet::new(),
+            thumb_pending: false,
             selected: None,
+            loading: None,
+            doc: None,
             page: Page::Library,
             params: DevelopParameters::default(),
-            curve_points: std::array::from_fn(|_| {
-                vec![
-                    [0.0, 0.0],
-                    [0.25, 0.25],
-                    [0.5, 0.5],
-                    [0.75, 0.75],
-                    [1.0, 1.0],
-                ]
-            }),
-            curve_channel: 0,
-            wheel_values: [(0.58, 0.0, 0.0); 3],
-            clipping: [false; 2],
-            preview_dirty: false,
-            preview_scheduled: false,
-            loading_photo: false,
-            load_generation: 0,
-            xmp_generation: 0,
-            catalog_scroll_y: 0.0,
-            catalog_view_height: 700.0,
-            catalog_view_width: 960.0,
-            catalog_scroll_id: scrollable::Id::unique(),
+            history: HistoryGraph::new(DevelopParameters::default(), "Imported"),
+            snapshots: Vec::new(),
             viewport: None,
+            original: None,
+            original_for: None,
             histogram: None,
-            histogram_data: None,
+            histogram_bitmap: None,
+            render_in_flight: false,
+            render_dirty: false,
+            render_ms: 0.0,
+            used_gpu: false,
             gpu,
             gpu_engine,
-            original_viewport: None,
-            original_asset_index: None,
             zoom: ZoomMode::Fit,
             view_mode: ViewMode::Single,
             divider: 0.5,
-            pan: [0.5, 0.5],
-            custom_zoom: 1.0,
-            preview_dimensions: (0, 0),
-            status: format!("{} photos indexed in catalog", count),
+            left_open: true,
+            right_open: true,
+            filmstrip_open: true,
+            sections: [true; 3],
+            folder_filter: None,
+            theme: darkroom_theme(),
+            status,
+            ext: ExtState::new(),
         }
+    }
+
+    /// Initial state plus the first thumbnail job.
+    pub fn boot() -> (Self, Task<Message>) {
+        let mut state = Self::new();
+        let task = next_thumbnail(&mut state);
+        (state, task)
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    Import,
-    Imported(Vec<PathBuf>),
-    ImportFinished(
-        Vec<CatalogItem>,
-        Vec<(u64, RawAsset, CullingMetrics)>,
-        Vec<String>,
-    ),
-    Select(usize),
-    Navigate(Page),
-    Exposure(f32),
-    Contrast(f32),
-    Highlights(f32),
-    Shadows(f32),
-    Whites(f32),
-    Blacks(f32),
-    Temperature(f32),
-    Tint(f32),
-    Rating(u8),
-    Flag(&'static str),
-    ColorLabel(&'static str),
-    Reset,
-    Save,
-    SetZoom(ZoomMode),
-    ToggleZoom,
-    SetViewMode(ViewMode),
-    ToggleComparison,
-    Divider(f32),
-    KeyPressed(String),
-    PanTo(f32, f32),
-    PanBy(f32, f32),
-    WheelZoom(f32),
-    HistogramAdjust(histogram::Zone, f32),
-    CurvePoint(usize, [f32; 2]),
-    CurveChannel(usize),
-    Wheel(usize, f32, f32),
-    WheelLuma(usize, f32),
-    ToggleClipping(usize),
-    RefreshDisplay,
-    RefreshPreview,
-    PhotoDecoded(usize, u64, Result<(RawAsset, CullingMetrics), String>),
-    CatalogScrolled(f32, f32, f32),
-    HistoryStep(bool),
-    HistorySelect(i64),
-    SyncXmp(u64),
-    ThumbnailReady(usize, Result<Vec<u8>, String>),
-    ExportAll(ExportFormat),
-    ExportFinished(Result<Vec<Result<PathBuf, String>>, String>),
-    SharpnessThreshold(f32),
-    ClippingThreshold(f32),
-    ToggleCullingFilter,
-    MaskTool(bool),
-    MaskPoint([f32; 2]),
-    MaskReady(usize, u64, u64, Result<Mask, String>),
-    ClearMask,
+pub fn run() -> iced::Result {
+    let icon = iced::window::icon::from_file_data(include_bytes!("../../../assets/favicon.png"), None)
+        .expect("failed to load window icon");
+
+    iced::application(title, update, view)
+        .theme(|state: &State| state.theme.clone())
+        .subscription(subscription)
+        .window(iced::window::Settings { icon: Some(icon), ..Default::default() })
+        .window_size(Size::new(1200.0, 600.0))
+        .centered()
+        .run_with(State::boot)
 }
 
+fn title(state: &State) -> String {
+    match &state.doc {
+        Some(doc) => format!("{} — Halation", doc.filename),
+        None => "Halation".to_owned(),
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Async jobs
+// ------------------------------------------------------------------------------------------------
+
+async fn pick_files() -> Vec<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("Photos", SUPPORTED_EXTENSIONS)
+        .pick_files()
+        .await
+        .map(|files| files.into_iter().map(|f| f.path().to_path_buf()).collect())
+        .unwrap_or_default()
+}
+
+async fn pick_folder() -> Vec<PathBuf> {
+    match rfd::AsyncFileDialog::new().pick_folder().await {
+        Some(dir) => scan_folder(dir.path()),
+        None => Vec::new(),
+    }
+}
+
+fn scan_folder(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| SUPPORTED_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+async fn import_paths(catalog: Catalog, paths: Vec<PathBuf>) -> ImportReport {
+    let mut report = ImportReport::default();
+    for path in paths {
+        let metadata = read_metadata(&path);
+        match catalog.import_asset(&path, &metadata) {
+            Ok(id) => {
+                report.imported += 1;
+                report.first_id.get_or_insert(id);
+            }
+            Err(e) => report.errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+    report
+}
+
+async fn load_document(id: u64, path: PathBuf) -> Result<Arc<Document>, LoadError> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let asset = decode_file(&path).map_err(|e| LoadError { id, message: format!("Could not open {name}: {e}") })?;
+    let full_size = (asset.buffer.width, asset.buffer.height);
+    let preview = Arc::new(make_preview(&asset.buffer, PREVIEW_MAX));
+    Ok(Arc::new(Document { id, filename: asset.filename, metadata: asset.metadata, full_size, preview }))
+}
+
+async fn make_thumbnail(id: u64, path: PathBuf) -> (u64, Option<image::Handle>) {
+    match decode_thumbnail(&path, THUMB_MAX) {
+        Ok(t) => (id, Some(image::Handle::from_rgba(t.width, t.height, t.rgba))),
+        Err(_) => (id, None),
+    }
+}
+
+async fn render_job(
+    doc: Arc<Document>,
+    params: DevelopParameters,
+    gpu: Option<Arc<GpuDevelopEngine>>,
+    with_original: bool,
+    ctx: RenderContext,
+) -> Arc<RenderResult> {
+    let started = std::time::Instant::now();
+    let out = process_with_context(&doc.preview, &params, gpu.as_deref(), &ctx);
+    let display = image::Handle::from_rgba(out.width, out.height, out.display_rgba);
+    let histogram_bitmap = image::Handle::from_rgba(HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT, out.histogram_rgba);
+    let original = with_original.then(|| {
+        let baseline_ctx = RenderContext { display: ctx.display.clone(), mask: None, dither: true, clip_overlay: false };
+        let o = process_with_context(&doc.preview, &DevelopParameters::default(), gpu.as_deref(), &baseline_ctx);
+        image::Handle::from_rgba(o.width, o.height, o.display_rgba)
+    });
+    Arc::new(RenderResult {
+        doc_id: doc.id,
+        display,
+        histogram: out.histogram,
+        histogram_bitmap,
+        original,
+        used_gpu: out.used_gpu,
+        millis: started.elapsed().as_secs_f32() * 1000.0,
+    })
+}
+
+// ------------------------------------------------------------------------------------------------
+// Update
+// ------------------------------------------------------------------------------------------------
+
 pub fn update(state: &mut State, message: Message) -> Task<Message> {
-    let changed = matches!(
-        &message,
-        Message::Exposure(_)
-            | Message::Contrast(_)
-            | Message::Highlights(_)
-            | Message::Shadows(_)
-            | Message::Whites(_)
-            | Message::Blacks(_)
-            | Message::Temperature(_)
-            | Message::Tint(_)
-            | Message::CurvePoint(_, _)
-            | Message::Wheel(_, _, _)
-            | Message::WheelLuma(_, _)
-            | Message::ToggleClipping(_)
-            | Message::Reset
-            | Message::HistogramAdjust(_, _)
-    );
+    let task = update_inner(state, message);
+    if std::mem::take(&mut state.ext.xmp_pending) {
+        Task::batch([task, ext::schedule_xmp(state)])
+    } else {
+        task
+    }
+}
+
+fn update_inner(state: &mut State, message: Message) -> Task<Message> {
     match message {
-        Message::Import => {
-            let paths = rfd::FileDialog::new()
-                .add_filter(
-                    "Photos",
-                    &[
-                        "arw", "cr2", "cr3", "nef", "dng", "tif", "tiff", "jpg", "jpeg", "png",
-                        "webp",
-                    ],
-                )
-                .pick_files()
-                .unwrap_or_default();
-            return Task::done(Message::Imported(paths));
+        Message::Noop => Task::none(),
+        Message::Navigate(page) => {
+            state.page = page;
+            Task::none()
         }
-        Message::Imported(paths) => {
-            let catalog = state.catalog.clone();
-            return Task::perform(
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut imported = Vec::new();
-                        let mut errors = Vec::new();
-                        for path in paths {
-                            match decode_file(&path) {
-                                Ok(mut raw) => {
-                                    let metrics = analyze_for_culling(&raw);
-                                    match catalog.import_asset(&path, &raw.metadata) {
-                                        Ok(id) => {
-                                            raw.id = id;
-                                            catalog.save_culling_metrics(
-                                                id,
-                                                metrics.sharpness,
-                                                metrics.clipped_highlights,
-                                            );
-                                            imported.push((id, raw, metrics));
-                                        }
-                                        Err(error) => {
-                                            errors.push(format!("{}: {error}", path.display()))
-                                        }
-                                    }
-                                }
-                                Err(error) => errors.push(format!("{}: {error}", path.display())),
-                            }
-                        }
-                        (catalog.load_items(), imported, errors)
-                    })
-                    .await
-                    .unwrap_or_else(|error| (Vec::new(), Vec::new(), vec![error.to_string()]))
-                },
-                |(items, imported, errors)| Message::ImportFinished(items, imported, errors),
-            );
-        }
-        Message::ImportFinished(items, imported, errors) => {
-            let count = imported.len();
-            state.items = items;
-            state.raw_assets = vec![None; state.items.len()];
-            state.thumbnails = vec![None; state.items.len()];
-            let stored_culling = state.catalog.load_culling_metrics();
-            state.culling_metrics = state
-                .items
-                .iter()
-                .map(|item| {
-                    stored_culling
-                        .get(&item.id)
-                        .map(|(sharpness, clipped_highlights)| CullingMetrics {
-                            sharpness: *sharpness,
-                            clipped_highlights: *clipped_highlights,
-                        })
-                })
-                .collect();
-            state.thumbnail_requested.clear();
-            let mut latest = None;
-            for (id, raw, metrics) in imported {
-                if let Some(index) = state.items.iter().position(|item| item.id == id) {
-                    state.raw_assets[index] = Some(raw);
-                    state.culling_metrics[index] = Some(metrics);
-                    latest = Some(index);
-                }
+        Message::ImportDialog => Task::perform(pick_files(), Message::Picked),
+        Message::FolderDialog => Task::perform(pick_folder(), Message::Picked),
+        Message::Picked(paths) => {
+            if paths.is_empty() {
+                return Task::none();
             }
-            state.status = if errors.is_empty() {
-                format!("Imported {count} photo(s)")
+            state.status = format!("Importing {} file(s)…", paths.len());
+            Task::perform(import_paths(state.catalog.clone(), paths), Message::Imported)
+        }
+        Message::Imported(report) => {
+            let selected_id = state.selected.and_then(|i| state.items.get(i)).map(|i| i.id);
+            state.items = state.catalog.load_items();
+            state.selected = selected_id.and_then(|id| state.items.iter().position(|i| i.id == id));
+            state.status = if report.errors.is_empty() {
+                format!("Imported {} photo(s)", report.imported)
             } else {
-                format!("Import complete; {} failed: {}", errors.len(), errors[0])
+                format!("Imported {}; {} failed: {}", report.imported, report.errors.len(), report.errors[0])
             };
-            if let Some(index) = latest {
-                select_photo(state, index);
-            }
-        }
-        Message::Select(index) => return open_photo(state, index),
-        Message::Navigate(page) => state.page = page,
-        Message::CatalogScrolled(y, height, width) => {
-            state.catalog_scroll_y = y;
-            state.catalog_view_height = height;
-            state.catalog_view_width = width;
-            const ROW_HEIGHT: f32 = 190.0;
-            const HEADER_HEIGHT: f32 = 58.0;
-            let columns = catalog_columns(width);
-            let first_row = (((y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize).saturating_sub(2);
-            let row_count = (height / ROW_HEIGHT).ceil() as usize + 4;
-            let first = first_row * columns;
-            let visible_items = visible_catalog_indices(state);
-            let end = ((first_row + row_count) * columns).min(visible_items.len());
             let mut tasks = Vec::new();
-            for index in visible_items.into_iter().skip(first).take(end.saturating_sub(first)) {
-                if state.thumbnails[index].is_none() && state.thumbnail_requested.insert(index) {
-                    let path = state.items[index].path.clone();
-                    let cache = state.thumbnail_cache.clone();
-                    tasks.push(Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                cache.get_or_create(&path).map(|bytes| (*bytes).clone())
-                            })
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result)
-                        },
-                        move |result| Message::ThumbnailReady(index, result),
-                    ));
-                }
+            if let Some(index) = report.first_id.and_then(|id| state.items.iter().position(|i| i.id == id)) {
+                tasks.push(open_photo(state, index));
             }
-            return Task::batch(tasks);
+            tasks.push(next_thumbnail(state));
+            Task::batch(tasks)
         }
-        Message::HistoryStep(redo) => {
-            if let Some(index) = state.selected {
-                let id = state.items[index].id;
-                let history = state.catalog.history(id);
-                let active = state.catalog.active_history_id(id);
-                let target = if redo {
-                    history
-                        .iter()
-                        .find(|entry| entry.parent_id == active)
-                        .map(|entry| entry.id)
-                } else {
-                    active.and_then(|active_id| {
-                        history
-                            .iter()
-                            .find(|entry| entry.id == active_id)
-                            .and_then(|entry| entry.parent_id)
-                    })
-                };
-                if let Some(target) = target {
-                    return Task::done(Message::HistorySelect(target));
-                }
-            }
-        }
-        Message::HistorySelect(history_id) => {
-            if let Some(index) = state.selected {
-                if let Some(params) = state
-                    .catalog
-                    .activate_history(state.items[index].id, history_id)
-                {
-                    state.items[index].params = params.clone();
-                    sync_controls_from_params(state, params);
-                    let _ = state
-                        .catalog
-                        .write_xmp_sidecar(state.items[index].id, &state.params);
-                    state.preview_dirty = true;
-                }
-            }
-        }
-        Message::SyncXmp(generation) => {
-            if generation == state.xmp_generation {
-                if let Some(index) = state.selected {
-                    let id = state.items[index].id;
-                    state.catalog.save_parameters(id, &state.params);
-                    let _ = state.catalog.write_xmp_sidecar(id, &state.params);
-                    state.items[index].params = state.params.clone();
-                }
-            }
-        }
-        Message::ThumbnailReady(index, result) => {
-            if let Some(slot) = state.thumbnails.get_mut(index) {
-                if let Ok(bytes) = result {
-                    *slot = Some(image::Handle::from_bytes(bytes));
-                }
-            }
-        }
-        Message::ExportAll(format) => {
-            if state.exporting {
+        Message::Select(index) => open_photo(state, index),
+        Message::Step(delta) => {
+            let visible = visible_indices(state);
+            if visible.is_empty() {
                 return Task::none();
             }
-            let Some(directory) = rfd::FileDialog::new().pick_folder() else {
-                return Task::none();
+            let pos = state.selected.and_then(|s| visible.iter().position(|&i| i == s));
+            let next = match pos {
+                Some(p) => (p as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+                None => 0,
             };
-            let jobs: Vec<ExportJob> = state
-                .items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let mut destination = directory.join(&item.filename);
-                    let ext = match format {
-                        ExportFormat::Jpeg => "jpg",
-                        ExportFormat::Png => "png",
-                        ExportFormat::WebP => "webp",
-                        ExportFormat::Tiff => "tif",
-                    };
-                    destination.set_extension(ext);
-                    ExportJob {
-                        source: item.path.clone(),
-                        destination,
-                        params: if state.selected == Some(index) {
-                            state.params.clone()
-                        } else {
-                            item.params.clone()
-                        },
-                    }
-                })
-                .collect();
-            state.exporting = true;
-            state.status = format!("Exporting {} master exposures...", jobs.len());
-            return Task::perform(
-                async move {
-                    tokio::task::spawn_blocking(move || export_batch(&jobs, format))
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-                Message::ExportFinished,
-            );
+            if Some(visible[next]) == state.selected {
+                return Task::none();
+            }
+            open_photo(state, visible[next])
         }
-        Message::ExportFinished(result) => {
-            state.exporting = false;
-            state.status = match result {
-                Ok(results) => {
-                    let succeeded = results.iter().filter(|result| result.is_ok()).count();
-                    let failed = results.len() - succeeded;
-                    if failed == 0 {
-                        format!("Exported {succeeded} photos successfully")
-                    } else {
-                        format!("Exported {succeeded}; {failed} failed")
-                    }
+        Message::Opened(Ok(doc)) => {
+            if state.loading != Some(doc.id) {
+                return Task::none();
+            }
+            state.loading = None;
+            state.status = format!("{} · {}×{}", doc.filename, doc.full_size.0, doc.full_size.1);
+            state.doc = Some(doc);
+            ext::import_sidecar_if_external(state);
+            let mask = ext::restore_mask(state);
+            Task::batch([request_render(state), mask, ext::refresh_detail(state)])
+        }
+        Message::Opened(Err(e)) => {
+            if state.loading == Some(e.id) {
+                state.loading = None;
+                state.status = e.message;
+            }
+            Task::none()
+        }
+        Message::Rendered(result) => {
+            state.render_in_flight = false;
+            if state.doc.as_ref().map(|d| d.id) == Some(result.doc_id) {
+                state.viewport = Some(result.display.clone());
+                state.histogram = Some(result.histogram.clone());
+                state.histogram_bitmap = Some(result.histogram_bitmap.clone());
+                if let Some(original) = &result.original {
+                    state.original = Some(original.clone());
+                    state.original_for = Some(result.doc_id);
                 }
-                Err(error) => format!("Export failed: {error}"),
-            };
-        }
-        Message::SharpnessThreshold(value) => {
-            state.sharpness_threshold = value;
-            if state.filter_culling {
-                return Task::done(Message::CatalogScrolled(
-                    state.catalog_scroll_y,
-                    state.catalog_view_height,
-                    state.catalog_view_width,
-                ));
+                state.render_ms = result.millis;
+                state.used_gpu = result.used_gpu;
             }
+            let again = if state.render_dirty { request_render(state) } else { Task::none() };
+            Task::batch([again, ext::refresh_detail(state)])
         }
-        Message::ClippingThreshold(value) => {
-            state.clipping_threshold = value;
-            if state.filter_culling {
-                return Task::done(Message::CatalogScrolled(
-                    state.catalog_scroll_y,
-                    state.catalog_view_height,
-                    state.catalog_view_width,
-                ));
-            }
-        }
-        Message::ToggleCullingFilter => {
-            state.filter_culling = !state.filter_culling;
-            state.catalog_scroll_y = 0.0;
-            let scroll = scrollable::scroll_to(
-                state.catalog_scroll_id.clone(),
-                scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-            );
-            let thumbnails = Task::done(Message::CatalogScrolled(
-                0.0,
-                state.catalog_view_height,
-                state.catalog_view_width,
-            ));
-            return Task::batch([scroll, thumbnails]);
-        }
-        Message::MaskTool(enabled) => state.mask_tool = enabled,
-        Message::MaskPoint(point) => {
-            let Some(index) = state.selected else {
-                return Task::none();
-            };
-            let path = state.items[index].path.clone();
-            let ml = state.ml.clone();
-            let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../models/mobilesam/mobilesam-onnx-float");
-            state.status = "Inference: MobileSAM segmentation...".into();
-            let generation = state.load_generation;
-            state.mask_generation = state.mask_generation.wrapping_add(1);
-            let mask_generation = state.mask_generation;
-            return Task::perform(
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        let mut slot = ml.lock().map_err(|e| e.to_string())?;
-                        if slot.is_none() {
-                            *slot = Some(MobileSam::load(&model_dir)?);
-                        }
-                        slot.as_mut()
-                            .ok_or("MobileSAM failed to initialize")?
-                            .select_point(&path, point)
-                    })
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|result| result)
-                },
-                move |result| Message::MaskReady(index, generation, mask_generation, result),
-            );
-        }
-        Message::MaskReady(index, generation, mask_generation, result) => {
-            if state.selected == Some(index)
-                && state.load_generation == generation
-                && state.mask_generation == mask_generation
-            {
-                match result {
-                    Ok(mask) => match mask.overlay_rgba() {
-                        Ok(rgba) => {
-                            state.mask_overlay =
-                                Some(image::Handle::from_rgba(mask.width, mask.height, rgba));
-                            state.mask_tool = false;
-                            state.status = "MobileSAM target overlay active".into();
-                        }
-                        Err(error) => state.status = format!("Mask overlay generation failed: {error}"),
-                    },
-                    Err(error) => state.status = format!("MobileSAM inference failed: {error}"),
+        Message::Thumbnail(id, handle) => {
+            state.thumb_pending = false;
+            match handle {
+                Some(h) => {
+                    state.thumbs.insert(id, h);
+                }
+                None => {
+                    state.thumb_failed.insert(id);
                 }
             }
+            next_thumbnail(state)
         }
-        Message::ClearMask => state.mask_overlay = None,
-        Message::Exposure(v) => state.params.exposure = v,
-        Message::Contrast(v) => state.params.contrast = v,
-        Message::Highlights(v) => state.params.highlights = v,
-        Message::Shadows(v) => state.params.shadows = v,
-        Message::Whites(v) => state.params.whites = v,
-        Message::Blacks(v) => state.params.blacks = v,
-        Message::Temperature(v) => state.params.temperature = v,
-        Message::Tint(v) => state.params.tint = v,
-        Message::CurvePoint(index, point) => {
-            let curve = &mut state.curve_points[state.curve_channel];
-            if index > 0 && index + 1 < curve.len() {
-                let left = curve[index - 1][0] + 0.005;
-                let right = curve[index + 1][0] - 0.005;
-                curve[index] = [point[0].clamp(left, right), point[1]];
-                let p = curve[index];
-                let offset = state.curve_channel * 5 + index;
-                state.params.tone_curve[offset] = p;
+        Message::Param(id, slider_value) => {
+            if state.doc.is_none() {
+                return Task::none();
             }
+            let value = id.from_slider(slider_value);
+            if (id.get(&state.params) - value).abs() < 1.0e-6 {
+                return Task::none();
+            }
+            id.set(&mut state.params, value);
+            request_render(state)
         }
-        Message::CurveChannel(channel) => state.curve_channel = channel.min(3),
-        Message::Wheel(index, hue, saturation) => {
-            if let Some(value) = state.wheel_values.get_mut(index) {
-                value.0 = hue;
-                value.1 = saturation;
-                state.params.color_grading[index][0] = hue;
-                state.params.color_grading[index][1] = saturation;
-            }
+        Message::CommitEdit => {
+            let (params, label, detail) = (state.params.clone(), None::<String>, String::new());
+            commit(state, params, label, detail);
+            Task::none()
         }
-        Message::WheelLuma(index, value) => {
-            if let Some(wheel) = state.wheel_values.get_mut(index) {
-                wheel.2 = value;
-                state.params.color_grading[index][2] = value;
-            }
+        Message::ResetParam(id) => {
+            state.params.reset_param(id);
+            let params = state.params.clone();
+            commit(state, params, Some(format!("Reset {}", id.label())), String::new());
+            request_render(state)
         }
-        Message::ToggleClipping(index) => {
-            if let Some(mask) = state.clipping.get_mut(index) {
-                *mask = !*mask;
+        Message::ResetSection(section) => {
+            for id in section.ids() {
+                state.params.reset_param(*id);
             }
+            let params = state.params.clone();
+            commit(state, params, Some(format!("Reset {}", section.title())), String::new());
+            request_render(state)
         }
-        Message::RefreshDisplay => {
-            refresh_display_profile(state);
-            if state.thumbnails.iter().all(|t| t.is_none()) && !state.items.is_empty() {
-                return Task::done(Message::CatalogScrolled(0.0, 800.0, 960.0));
-            }
+        Message::ResetAll => {
+            state.params = DevelopParameters::default();
+            let params = state.params.clone();
+            commit(state, params, Some("Reset all".into()), String::new());
+            request_render(state)
+        }
+        Message::Undo => match state.history.undo().cloned() {
+            Some(p) => apply_params(state, p),
+            None => Task::none(),
         },
-        Message::RefreshPreview => {
-            state.preview_scheduled = false;
-            if state.preview_dirty {
-                state.preview_dirty = false;
-                refresh(state);
-            }
-        }
-        Message::PhotoDecoded(index, generation, result) => match result {
-            Ok((raw, metrics)) => {
-                state.raw_assets[index] = Some(raw);
-                state.culling_metrics[index] = Some(metrics);
-                if state.selected == Some(index) && state.load_generation == generation {
-                    state.loading_photo = false;
-                    state.status = format!("Loaded {}", state.items[index].filename);
-                    refresh(state);
-                }
-            }
-            Err(error) => {
-                if state.selected == Some(index) && state.load_generation == generation {
-                    state.loading_photo = false;
-                    state.status =
-                        format!("Failed to load {}: {error}", state.items[index].filename);
-                }
-            }
+        Message::Redo => match state.history.redo().cloned() {
+            Some(p) => apply_params(state, p),
+            None => Task::none(),
         },
+        Message::HistoryCheckout(id) => match state.history.checkout(id).cloned() {
+            Some(p) => apply_params(state, p),
+            None => Task::none(),
+        },
+        Message::SnapshotAdd => {
+            if state.doc.is_some() {
+                let name = format!("Snapshot {}", state.snapshots.len() + 1);
+                state.snapshots.push((name, state.params.clone()));
+            }
+            Task::none()
+        }
+        Message::SnapshotApply(index) => {
+            let Some((name, params)) = state.snapshots.get(index).cloned() else { return Task::none() };
+            state.params = params.clone();
+            commit(state, params, Some(format!("Snapshot: {name}")), String::new());
+            request_render(state)
+        }
+        Message::ToggleSection(section) => {
+            state.sections[section.index()] ^= true;
+            Task::none()
+        }
+        Message::TogglePanel(panel) => {
+            match panel {
+                Panel::Left => state.left_open ^= true,
+                Panel::Right => state.right_open ^= true,
+                Panel::Filmstrip => state.filmstrip_open ^= true,
+            }
+            Task::none()
+        }
+        Message::FolderFilter(filter) => {
+            state.folder_filter = filter;
+            Task::none()
+        }
         Message::Rating(rating) => {
             if let Some(i) = state.selected {
+                let rating = rating.min(5);
                 state.catalog.update_rating(state.items[i].id, rating);
                 state.items[i].rating = rating;
+                state.ext.xmp_pending = true;
             }
+            Task::none()
         }
         Message::Flag(flag) => {
             if let Some(i) = state.selected {
                 state.catalog.update_flag(state.items[i].id, flag);
                 state.items[i].flag = flag.into();
+                state.ext.xmp_pending = true;
             }
-        }
-        Message::ColorLabel(label) => {
-            if let Some(i) = state.selected {
-                state.catalog.update_color_label(state.items[i].id, label);
-                state.items[i].color_label = label.into();
-            }
-        }
-        Message::Reset => {
-            state.params = DevelopParameters::default();
-            state.curve_points = std::array::from_fn(|_| {
-                vec![
-                    [0.0, 0.0],
-                    [0.25, 0.25],
-                    [0.5, 0.5],
-                    [0.75, 0.75],
-                    [1.0, 1.0],
-                ]
-            });
-            state.wheel_values = [(0.58, 0.0, 0.0); 3];
-            state.clipping = [false; 2];
-            state.preview_dirty = true;
-        }
-        Message::Save => {
-            if let Some(i) = state.selected {
-                let id = state.items[i].id;
-                if let Err(error) =
-                    state
-                        .catalog
-                        .commit_history(id, "Manual Develop", &state.params)
-                {
-                    state.status = format!("History commit failed: {error}");
-                }
-                if let Err(error) = state.catalog.write_xmp_sidecar(id, &state.params) {
-                    state.status = format!("XMP sidecar sync failed: {error}");
-                }
-                state.items[i].params = state.params.clone();
-                if !state.status.starts_with("History commit failed")
-                    && !state.status.starts_with("XMP sidecar sync failed")
-                {
-                    state.status = "Edits synced to catalog and XMP sidecar".into();
-                }
-            }
+            Task::none()
         }
         Message::SetZoom(zoom) => {
             state.zoom = zoom;
-            state.custom_zoom = 1.0;
-            state.pan = [0.5, 0.5];
+            state.ext.view = viewport::ViewTransform { mode: zoom, scale: 1.0, center: [0.5, 0.5] };
+            ext::refresh_detail(state)
         }
         Message::ToggleZoom => {
-            state.zoom = if state.zoom == ZoomMode::Fit {
-                ZoomMode::Actual
-            } else {
-                ZoomMode::Fit
-            };
+            let Some(doc) = state.doc.clone() else { return Task::none() };
+            let pane = ext::pane_size(state);
+            let anchor = iced::Point::new(pane.width * 0.5, pane.height * 0.5);
+            state.ext.view = state.ext.view.toggled_at(doc.full_size, pane, anchor);
+            state.zoom = state.ext.view.mode;
+            ext::refresh_detail(state)
         }
-        Message::SetViewMode(mode) => state.view_mode = mode,
+        Message::SetViewMode(mode) => {
+            state.view_mode = mode;
+            state.ext.compare = match mode {
+                ViewMode::Single => Compare::Off,
+                ViewMode::SplitSideBySide => Compare::SideBySide,
+                ViewMode::SplitTopBottom => Compare::TopBottom,
+                ViewMode::Wipe => Compare::Wipe(state.divider),
+            };
+            Task::none()
+        }
         Message::ToggleComparison => {
-            state.view_mode = if state.view_mode == ViewMode::Single {
-                ViewMode::SplitSideBySide
-            } else {
-                ViewMode::Single
-            };
+            let next = if state.view_mode == ViewMode::Single { ViewMode::Wipe } else { ViewMode::Single };
+            update_inner(state, Message::SetViewMode(next))
         }
-        Message::Divider(value) => state.divider = value,
-        Message::PanTo(x, y) => state.pan = [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)],
-        Message::PanBy(dx, dy) => {
-            state.pan[0] = (state.pan[0] - dx).clamp(0.0, 1.0);
-            state.pan[1] = (state.pan[1] - dy).clamp(0.0, 1.0);
-        }
-        Message::WheelZoom(delta) => {
-            state.custom_zoom = (state.custom_zoom * (1.0 + delta * 0.12)).clamp(0.25, 4.0);
-            state.zoom = ZoomMode::Custom;
-        }
-        Message::HistogramAdjust(zone, delta) => {
-            match zone {
-                histogram::Zone::Blacks => {
-                    state.params.blacks = (state.params.blacks + delta).clamp(-100.0, 100.0)
-                }
-                histogram::Zone::Shadows => {
-                    state.params.shadows = (state.params.shadows + delta).clamp(-100.0, 100.0)
-                }
-                histogram::Zone::Exposure => {
-                    state.params.exposure = (state.params.exposure + delta).clamp(-5.0, 5.0)
-                }
-                histogram::Zone::Highlights => {
-                    state.params.highlights = (state.params.highlights + delta).clamp(-100.0, 100.0)
-                }
-                histogram::Zone::Whites => {
-                    state.params.whites = (state.params.whites + delta).clamp(-100.0, 100.0)
-                }
+        Message::Divider(value) => {
+            state.divider = value;
+            if matches!(state.ext.compare, Compare::Wipe(_)) {
+                state.ext.compare = Compare::Wipe(value);
             }
-            state.preview_dirty = true;
+            Task::none()
         }
-        Message::KeyPressed(key) if state.page == Page::Library => {
-            if matches!(
-                key.as_str(),
-                "ArrowDown" | "ArrowRight" | "ArrowUp" | "ArrowLeft"
-            ) {
-                let visible = visible_catalog_indices(state);
-                if visible.is_empty() {
-                    return Task::none();
-                }
-                let columns = catalog_columns(state.catalog_view_width);
-                let current = state
-                    .selected
-                    .and_then(|selected| visible.iter().position(|index| *index == selected))
-                    .unwrap_or(0);
-                let next_position = match key.as_str() {
-                    "ArrowDown" => (current + columns).min(visible.len() - 1),
-                    "ArrowUp" => current.saturating_sub(columns),
-                    "ArrowRight" => (current + 1).min(visible.len() - 1),
-                    _ => current.saturating_sub(1),
-                };
-                let next = visible[next_position];
-                state.selected = Some(next);
-                const HEADER_HEIGHT: f32 = 58.0;
-                const ROW_HEIGHT: f32 = 190.0;
-                let row_y = HEADER_HEIGHT + (next_position / columns) as f32 * ROW_HEIGHT;
-                let target_y = if row_y < state.catalog_scroll_y {
-                    row_y
-                } else if row_y + ROW_HEIGHT
-                    > state.catalog_scroll_y + state.catalog_view_height
-                {
-                    (row_y + ROW_HEIGHT - state.catalog_view_height).max(0.0)
-                } else {
-                    state.catalog_scroll_y
-                };
-                state.catalog_scroll_y = target_y;
-                return scrollable::scroll_to(
-                    state.catalog_scroll_id.clone(),
-                    scrollable::AbsoluteOffset { x: 0.0, y: target_y },
-                );
-            }
-            if let Some(index) = state.selected {
-                match key.as_str() {
-                    "1" | "2" | "3" | "4" | "5" => {
-                        let rating = key.parse::<u8>().unwrap_or(0);
-                        state.catalog.update_rating(state.items[index].id, rating);
-                        state.items[index].rating = rating;
-                    }
-                    "6" | "7" | "8" | "9" => {
-                        let label = match key.as_str() {
-                            "6" => "Red",
-                            "7" => "Yellow",
-                            "8" => "Green",
-                            _ => "Blue",
-                        };
-                        state
-                            .catalog
-                            .update_color_label(state.items[index].id, label);
-                        state.items[index].color_label = label.into();
-                    }
-                    "z" | "Z" => state.items[index].flag = "Pick".into(),
-                    "x" | "X" => state.items[index].flag = "Reject".into(),
-                    "u" | "U" => state.items[index].flag = "None".into(),
-                    _ => {}
-                }
-                if matches!(key.as_str(), "z" | "Z" | "x" | "X" | "u" | "U") {
-                    let flag = state.items[index].flag.clone();
-                    state.catalog.update_flag(state.items[index].id, &flag);
-                }
-            }
+        Message::Peek(on) => {
+            state.ext.peek = on && state.doc.is_some();
+            Task::none()
         }
-        Message::KeyPressed(key) => match key.as_str() {
-            "z" | "Z" => {
-                state.zoom = if state.zoom == ZoomMode::Fit {
-                    ZoomMode::Actual
-                } else {
-                    ZoomMode::Fit
-                }
-            }
-            "\\" => {
-                state.view_mode = if state.view_mode == ViewMode::Single {
-                    ViewMode::SplitSideBySide
-                } else {
-                    ViewMode::Single
-                }
-            }
-            "1" => state.zoom = ZoomMode::Fit,
-            "2" => state.zoom = ZoomMode::Fill,
-            "3" => state.zoom = ZoomMode::Actual,
-            "4" => state.zoom = ZoomMode::Two,
-            "5" => state.zoom = ZoomMode::Four,
-            "j" | "J" => {
-                state.clipping[0] = !state.clipping[0];
-                state.clipping[1] = !state.clipping[1];
-                state.preview_dirty = true;
-            }
-            _ => {}
-        },
-    }
-    if changed {
-        state.preview_dirty = true;
-    }
-    let mut pending = Vec::new();
-    if changed {
-        state.xmp_generation = state.xmp_generation.wrapping_add(1);
-        let generation = state.xmp_generation;
-        pending.push(Task::perform(
-            async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                generation
-            },
-            Message::SyncXmp,
-        ));
-    }
-    if state.preview_dirty && !state.preview_scheduled {
-        state.preview_scheduled = true;
-        pending.push(Task::perform(
-            async { tokio::time::sleep(std::time::Duration::from_millis(60)).await },
-            |_| Message::RefreshPreview,
-        ));
-    }
-    Task::batch(pending)
-}
-
-fn select_photo(state: &mut State, index: usize) {
-    if index >= state.items.len() {
-        return;
-    }
-    state.selected = Some(index);
-    state.loading_photo = false;
-    state.load_generation = state.load_generation.wrapping_add(1);
-    state.pan = [0.5, 0.5];
-    state.custom_zoom = 1.0;
-    if state.original_asset_index != Some(index) {
-        state.original_viewport = None;
-        state.original_asset_index = None;
-    }
-    state.params = state.items[index].params.clone();
-    if state.params.tone_curve.len() == 20 {
-        for channel in 0..4 {
-            state.curve_points[channel] =
-                state.params.tone_curve[channel * 5..channel * 5 + 5].to_vec();
+        Message::View(event) => ext::on_view_event(state, event),
+        Message::Curve(edit) => ext::edit_curve(state, edit),
+        Message::Wheel(id, wheel) => ext::set_wheel(state, id, wheel),
+        Message::ToggleClipping => {
+            state.ext.clip_overlay ^= true;
+            request_render(state)
         }
-    }
-    for channel in 0..3 {
-        let grade = state.params.color_grading[channel];
-        state.wheel_values[channel] = (grade[0], grade[1], grade[2]);
-    }
-    if state.raw_assets[index].is_none() {
-        match decode_file(&state.items[index].path) {
-            Ok(raw) => state.raw_assets[index] = Some(raw),
-            Err(e) => {
-                state.status = format!("Could not decode {}: {e}", state.items[index].filename);
-                return;
-            }
-        }
-    }
-    refresh(state);
-    state.page = Page::Develop;
-}
-
-fn sync_controls_from_params(state: &mut State, params: DevelopParameters) {
-    state.params = params;
-    if state.params.tone_curve.len() == 20 {
-        for channel in 0..4 {
-            state.curve_points[channel] =
-                state.params.tone_curve[channel * 5..channel * 5 + 5].to_vec();
-        }
-    }
-    for channel in 0..3 {
-        let grade = state.params.color_grading[channel];
-        state.wheel_values[channel] = (grade[0], grade[1], grade[2]);
+        Message::Ext(m) => ext::update(state, m),
     }
 }
 
 fn open_photo(state: &mut State, index: usize) -> Task<Message> {
-    if index >= state.items.len() {
+    let Some(item) = state.items.get(index) else { return Task::none() };
+    let (id, path, filename, saved) = (item.id, item.path.clone(), item.filename.clone(), item.params.clone());
+    state.ext.reset_for_new_photo();
+    ext::history_open(state, id, &saved.sanitized());
+    state.selected = Some(index);
+    state.page = Page::Develop;
+    state.doc = None;
+    state.viewport = None;
+    state.original = None;
+    state.original_for = None;
+    state.histogram = None;
+    state.histogram_bitmap = None;
+    state.loading = Some(id);
+    state.status = format!("Opening {filename}…");
+    Task::perform(load_document(id, path), Message::Opened)
+}
+
+fn request_render(state: &mut State) -> Task<Message> {
+    let Some(doc) = state.doc.clone() else { return Task::none() };
+    if state.render_in_flight {
+        state.render_dirty = true;
         return Task::none();
     }
-    prepare_selected_photo(state, index);
-
-    // Eagerly request thumbnails for nearby filmstrip items
-    let mut tasks = Vec::new();
-    let start = index.saturating_sub(8);
-    let end = (index + 9).min(state.items.len());
-    for i in start..end {
-        if state.thumbnails[i].is_none() && state.thumbnail_requested.insert(i) {
-            let path = state.items[i].path.clone();
-            let cache = state.thumbnail_cache.clone();
-            tasks.push(Task::perform(
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        cache.get_or_create(&path).map(|bytes| (*bytes).clone())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result)
-                },
-                move |result| Message::ThumbnailReady(i, result),
-            ));
-        }
-    }
-
-    if state.raw_assets[index].is_some() {
-        state.loading_photo = false;
-        refresh(state);
-        state.page = Page::Develop;
-        return Task::batch(tasks);
-    }
-    state.loading_photo = true;
-    state.viewport = None;
-    state.original_viewport = None;
-    state.original_asset_index = None;
-    state.histogram = None;
-    state.histogram_data = None;
-    state.status = format!("Decoding {}...", state.items[index].filename);
-    let generation = state.load_generation;
-    let path = state.items[index].path.clone();
-    let asset_id = state.items[index].id;
-    let catalog = state.catalog.clone();
-    tasks.push(Task::perform(
-        async move {
-            tokio::task::spawn_blocking(move || {
-                let raw = decode_file(&path).map_err(|e| e.to_string())?;
-                let metrics = analyze_for_culling(&raw);
-                catalog.save_culling_metrics(
-                    asset_id,
-                    metrics.sharpness,
-                    metrics.clipped_highlights,
-                );
-                Ok::<_, String>((raw, metrics))
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|result| result)
-        },
-        move |result| Message::PhotoDecoded(index, generation, result),
-    ));
-    Task::batch(tasks)
+    state.render_in_flight = true;
+    state.render_dirty = false;
+    let with_original = state.original_for != Some(doc.id);
+    let ctx = ext::render_context(state);
+    Task::perform(render_job(doc, state.params.clone(), state.gpu_engine.clone(), with_original, ctx), Message::Rendered)
 }
 
-fn prepare_selected_photo(state: &mut State, index: usize) {
-    state.selected = Some(index);
-    state.mask_overlay = None;
-    state.load_generation = state.load_generation.wrapping_add(1);
-    state.pan = [0.5, 0.5];
-    state.custom_zoom = 1.0;
-    if state.original_asset_index != Some(index) {
-        state.original_viewport = None;
-        state.original_asset_index = None;
-    }
-    state.params = state.items[index].params.clone();
-    if let Ok(external) = Catalog::read_xmp_sidecar(&state.items[index].path) {
-        state.params.exposure = external.exposure;
-        state.params.contrast = external.contrast;
-        state.params.highlights = external.highlights;
-        state.params.shadows = external.shadows;
-        state.params.whites = external.whites;
-        state.params.blacks = external.blacks;
-        state.params.temperature = external.temperature;
-        state.params.tint = external.tint;
-    }
-    if state.params.tone_curve.len() == 20 {
-        for channel in 0..4 {
-            state.curve_points[channel] =
-                state.params.tone_curve[channel * 5..channel * 5 + 5].to_vec();
-        }
-    }
-    for channel in 0..3 {
-        let grade = state.params.color_grading[channel];
-        state.wheel_values[channel] = (grade[0], grade[1], grade[2]);
-    }
-    state.page = Page::Develop;
+fn next_thumbnail(state: &mut State) -> Task<Message> {
+    grid::request_visible(state)
 }
 
-fn refresh_display_profile(state: &mut State) {
-    let updated = state
-        .gpu_engine
-        .as_mut()
-        .is_some_and(GpuDevelopEngine::refresh_display_profile);
-    if updated {
-        state.gpu = state.gpu_engine.as_ref().unwrap().info().clone();
-        refresh(state);
-    }
+/// Record `params` in the history DAG (auto-labelled unless `label` is given) and persist it.
+fn commit(state: &mut State, params: DevelopParameters, label: Option<String>, detail: String) {
+    ext::history_commit(state, params, label, detail);
 }
 
-fn refresh(state: &mut State) {
-    let Some(index) = state.selected else { return };
-    let Some(raw) = state.raw_assets[index].as_ref() else {
-        return;
-    };
-    let scale = (PREVIEW_MAX as f32 / raw.buffer.width.max(raw.buffer.height) as f32).min(1.0);
-    let w = (raw.buffer.width as f32 * scale).round().max(1.0) as u32;
-    let h = (raw.buffer.height as f32 * scale).round().max(1.0) as u32;
-    state.preview_dimensions = (w, h);
-
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let sx = x * raw.buffer.width / w;
-            let sy = y * raw.buffer.height / h;
-            pixels.push(raw.buffer.pixels[(sy * raw.buffer.width + sx) as usize]);
-        }
-    }
-    let preview = RawAsset {
-        id: raw.id,
-        filename: raw.filename.clone(),
-        metadata: raw.metadata.clone(),
-        buffer: ImageBufferF32 {
-            width: w,
-            height: h,
-            pixels,
-        },
-    };
-    if state.original_asset_index != Some(index) {
-        let original = process_frame_with_gpu(
-            &preview,
-            &DevelopParameters::default(),
-            state.gpu_engine.as_ref(),
-        );
-        state.original_viewport = Some(image::Handle::from_rgba(w, h, original.display_rgba));
-        state.original_asset_index = Some(index);
-    }
-    let output = process_frame_with_gpu(&preview, &state.params, state.gpu_engine.as_ref());
-    let mut developed = output.display_rgba;
-    apply_clipping_mask(&mut developed, state.clipping);
-
-    state.viewport = Some(image::Handle::from_rgba(w, h, developed));
-    state.histogram = Some(image::Handle::from_rgba(256, 64, output.histogram_rgba));
-    state.histogram_data = Some(output.histogram);
+/// Undo / redo / history click: the graph head already moved, persist it and re-render.
+fn apply_params(state: &mut State, params: DevelopParameters) -> Task<Message> {
+    state.params = params;
+    ext::history_activate(state);
+    Task::batch([request_render(state), ext::refresh_detail(state)])
 }
 
-fn apply_clipping_mask(rgba: &mut [u8], clipping: [bool; 2]) {
-    if !clipping[0] && !clipping[1] {
-        return;
-    }
-    for pixel in rgba.chunks_exact_mut(4) {
-        let luma = 0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        let low = clipping[0] && luma < 4.0;
-        let high = clipping[1] && luma > 251.0;
-        if low || high {
-            pixel[0] = if low { 40 } else { 255 };
-            pixel[1] = if low { 120 } else { 35 };
-            pixel[2] = if low { 255 } else { 25 };
-        }
-    }
-}
-
-pub fn view(state: &State) -> Element<'_, Message> {
-    let brand = row![
-        text("HALATION").size(16).font(Font::with_name("Segoe UI")),
-        container(text("STUDIO").size(10).color(Color::from_rgb8(76, 215, 246)))
-            .padding([2, 5])
-            .style(container::rounded_box),
-    ]
-    .spacing(6)
-    .align_y(Center);
-
-    let nav_module = row![
-        button(text("Library").size(12))
-            .style(if state.page == Page::Library {
-                button::primary
-            } else {
-                button::text
-            })
-            .on_press(Message::Navigate(Page::Library)),
-        button(text("Develop").size(12))
-            .style(if state.page == Page::Develop {
-                button::primary
-            } else {
-                button::text
-            })
-            .on_press(Message::Navigate(Page::Develop)),
-    ]
-    .spacing(4)
-    .align_y(Center);
-
-    let loupe_quick = row![
-        button(text("FIT").size(10))
-            .style(if state.zoom == ZoomMode::Fit {
-                button::secondary
-            } else {
-                button::text
-            })
-            .on_press(Message::SetZoom(ZoomMode::Fit)),
-        button(text("100%").size(10))
-            .style(if state.zoom == ZoomMode::Actual {
-                button::secondary
-            } else {
-                button::text
-            })
-            .on_press(Message::SetZoom(ZoomMode::Actual)),
-        button(text("200%").size(10))
-            .style(if state.zoom == ZoomMode::Two {
-                button::secondary
-            } else {
-                button::text
-            })
-            .on_press(Message::SetZoom(ZoomMode::Two)),
-    ]
-    .spacing(2)
-    .align_y(Center);
-
-    let history_actions = row![
-        button(text("Undo").size(11))
-            .style(button::text)
-            .on_press(Message::HistoryStep(false)),
-        button(text("Redo").size(11))
-            .style(button::text)
-            .on_press(Message::HistoryStep(true)),
-        button(text(if state.view_mode == ViewMode::Single {
-            "Compare"
-        } else {
-            "Loupe"
-        }).size(11))
-        .style(if state.view_mode != ViewMode::Single {
-            button::secondary
-        } else {
-            button::text
-        })
-        .on_press(Message::ToggleComparison),
-    ]
-    .spacing(4)
-    .align_y(Center);
-
-    let export_actions = row![
-        button(text("JPEG").size(10))
-            .style(button::text)
-            .on_press(Message::ExportAll(ExportFormat::Jpeg)),
-        button(text("PNG").size(10))
-            .style(button::text)
-            .on_press(Message::ExportAll(ExportFormat::Png)),
-        button(text("WebP").size(10))
-            .style(button::text)
-            .on_press(Message::ExportAll(ExportFormat::WebP)),
-        button(text("TIFF").size(10))
-            .style(button::text)
-            .on_press(Message::ExportAll(ExportFormat::Tiff)),
-    ]
-    .spacing(3)
-    .align_y(Center);
-
-    let header = container(
-        row![
-            brand,
-            Space::with_width(Length::Fixed(16.0)),
-            nav_module,
-            Space::with_width(Length::Fixed(16.0)),
-            loupe_quick,
-            Space::with_width(Length::Fixed(12.0)),
-            history_actions,
-            Space::with_width(Length::Fill),
-            export_actions,
-            Space::with_width(Length::Fixed(12.0)),
-            button(text("Import Photos").size(11))
-                .style(button::primary)
-                .on_press(Message::Import),
-        ]
-        .align_y(Center)
-    )
-    .padding([6, 14])
-    .width(Length::Fill)
-    .style(container::rounded_box);
-
-    let content: Element<'_, Message> = match state.page {
-        Page::Library => library_page(state),
-        Page::Develop => develop_page(state),
-    };
-
-    let footer = container(
-        row![
-            text(format!("{} photos indexed", state.items.len()))
-                .size(10)
-                .font(Font::MONOSPACE),
-            Space::with_width(Length::Fixed(12.0)),
-            text(&state.status)
-                .size(10)
-                .font(Font::MONOSPACE)
-                .color(Color::from_rgb8(76, 215, 246)),
-            Space::with_width(Length::Fill),
-            text(format!(
-                "{}  ·  {}",
-                state.gpu.adapter_name, state.gpu.display_profile
-            ))
-            .size(10)
-            .color(Color::from_rgb8(150, 152, 156)),
-        ]
-        .align_y(Center)
-    )
-    .padding([5, 14])
-    .width(Length::Fill)
-    .style(container::rounded_box);
-
-    column![header, content, footer].spacing(4).into()
-}
-
-fn subscription(_state: &State) -> Subscription<Message> {
-    let events = event::listen_with(|event, status, _window| {
-        if status == event::Status::Captured {
-            return None;
-        }
-        match event {
-            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => match key.as_ref() {
-                keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                    Some(Message::KeyPressed("ArrowUp".into()))
-                }
-                keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                    Some(Message::KeyPressed("ArrowDown".into()))
-                }
-                keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                    Some(Message::KeyPressed("ArrowLeft".into()))
-                }
-                keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                    Some(Message::KeyPressed("ArrowRight".into()))
-                }
-                keyboard::Key::Character(value)
-                    if [
-                        "z", "Z", "j", "J", "\\", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-                        "x", "X", "u", "U",
-                    ]
-                    .contains(&value) =>
-                {
-                    Some(Message::KeyPressed(value.to_owned()))
-                }
-                _ => None,
-            },
-            Event::Window(iced::window::Event::Moved(_)) => Some(Message::RefreshDisplay),
-            _ => None,
-        }
-    });
-    Subscription::batch([
-        events,
-        iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::RefreshDisplay),
-    ])
-}
-
-fn library_page(state: &State) -> Element<'_, Message> {
-    const ROW_HEIGHT: f32 = 190.0;
-    const HEADER_HEIGHT: f32 = 58.0;
-    const GAP: f32 = 12.0;
-    let columns = catalog_columns(state.catalog_view_width);
-    let card_width = ((state.catalog_view_width - 40.0 - GAP * (columns - 1) as f32)
-        / columns as f32)
-        .max(160.0);
-    let mut grid = column![
-        row![
-            column![
-                text("PHOTO LIBRARY").size(13),
-                text("Browse, rate, and organize your originals")
-                    .size(11)
-                    .color(Color::from_rgb8(150, 152, 156)),
-            ]
-            .spacing(5),
-            Space::with_width(Length::Fill),
-            text(if state.filter_culling {
-                format!(
-                    "{} SELECTS / {} PHOTOS",
-                    visible_catalog_indices(state).len(),
-                    state.items.len()
-                )
-            } else {
-                format!("{} PHOTOS", state.items.len())
-            })
-                .size(10)
-                .color(Color::from_rgb8(150, 152, 156)),
-            button(text(if state.filter_culling {
-                "SHOW ALL"
-            } else {
-                "FILTER SELECTS"
-            })
-            .size(9))
-            .style(if state.filter_culling {
-                button::secondary
-            } else {
-                button::text
-            })
-            .on_press(Message::ToggleCullingFilter),
-        ]
-        .align_y(Center),
-    ]
-    .spacing(14);
-
-    if state.items.is_empty() {
-        grid = grid
-            .push(Space::with_height(Length::Fixed(60.0)))
-            .push(text("Catalog Empty").size(22))
-            .push(
-                text("Import raw files (DNG, ARW, CR2, NEF) or standard formats (JPEG, TIFF, PNG).")
-                    .size(12),
-            )
-            .push(button(text("Import Master Files")).on_press(Message::Import));
-    } else {
-        let visible_items = visible_catalog_indices(state);
-        if visible_items.is_empty() {
-            grid = grid
-                .push(Space::with_height(Length::Fixed(60.0)))
-                .push(text("No photos meet the current culling thresholds").size(18))
-                .push(
-                    button(text("Show All Photos"))
-                        .on_press(Message::ToggleCullingFilter),
-                );
-        }
-        let row_count = visible_items.len().div_ceil(columns);
-        let first_row = if row_count == 0 {
-            0
-        } else {
-            ((((state.catalog_scroll_y - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT) as usize)
-                .saturating_sub(2))
-            .min(row_count - 1)
-        };
-        let visible_rows = (state.catalog_view_height / ROW_HEIGHT).ceil() as usize + 4;
-        let end_row = (first_row + visible_rows).min(row_count);
-        if first_row > 0 {
-            grid = grid.push(Space::with_height(Length::Fixed(first_row as f32 * ROW_HEIGHT)));
-        }
-        for row_index in first_row..end_row {
-            let mut cards = row![].spacing(GAP).height(Length::Fixed(ROW_HEIGHT));
-            for idx in visible_items
-                .iter()
-                .skip(row_index * columns)
-                .take(columns)
-                .copied()
-            {
-                let item = &state.items[idx];
-                let is_selected = state.selected == Some(idx);
-                let preview: Element<'_, Message> = if let Some(handle) = &state.thumbnails[idx] {
-                    image(handle.clone())
-                        .content_fit(ContentFit::Contain)
-                        .width(Length::Fill)
-                        .height(Length::Fixed(126.0))
-                        .into()
-                } else {
-                    container(text("Loading preview").size(10).color(Color::from_rgb8(150, 152, 156)))
-                        .width(Length::Fill)
-                        .height(Length::Fixed(126.0))
-                        .align_x(iced::alignment::Horizontal::Center)
-                        .align_y(iced::alignment::Vertical::Center)
-                        .into()
-                };
-                let flag_color = match item.flag.as_str() {
-                    "Pick" => Color::from_rgb8(76, 215, 246),
-                    "Reject" => Color::from_rgb8(255, 180, 171),
-                    _ => Color::from_rgb8(150, 152, 156),
-                };
-                let format = item
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or("IMG")
-                    .to_ascii_uppercase();
-                let format = match format.as_str() {
-                    "JPG" | "JPEG" => "JPG",
-                    "TIF" | "TIFF" => "TIFF",
-                    "DNG" => "DNG",
-                    "ARW" | "CR2" | "CR3" | "NEF" | "RAF" | "RW2" | "ORF" => "RAW",
-                    _ => "IMG",
-                };
-                let culling_label = state.culling_metrics[idx].map(|metrics| {
-                    if metrics.sharpness < state.sharpness_threshold
-                        || metrics.clipped_highlights > state.clipping_threshold
-                    {
-                        ("REVIEW", Color::from_rgb8(255, 180, 171))
-                    } else {
-                        ("SELECT", Color::from_rgb8(76, 215, 246))
-                    }
-                });
-                let card = button(
-                    column![
-                        preview,
-                        text(&item.filename).size(11).font(Font::MONOSPACE),
-                        row![
-                            text(format!("* {}", item.rating)).size(10),
-                            text(format).size(9).color(Color::from_rgb8(76, 215, 246)),
-                            text(&item.flag).size(10).color(flag_color),
-                            text(&item.color_label).size(10),
-                            if let Some((label, color)) = culling_label {
-                                text(label).size(9).color(color)
-                            } else {
-                                text("").size(9)
-                            },
-                            Space::with_width(Length::Fill),
-                            text(format!("{:.1} MB", item.file_size as f32 / 1_000_000.0))
-                                .size(9)
-                                .color(Color::from_rgb8(150, 152, 156)),
-                        ]
-                        .spacing(8)
-                        .align_y(Center),
-                    ]
-                    .spacing(7)
-                    .padding(8)
-                    .width(Length::Fill),
-                )
-                .style(if is_selected { button::secondary } else { button::text })
-                .width(Length::Fixed(card_width))
-                .height(Length::Fill)
-                .on_press(Message::Select(idx));
-                cards = cards.push(card);
-            }
-            grid = grid.push(cards);
-        }
-        if end_row < row_count {
-            grid = grid.push(Space::with_height(Length::Fixed(
-                (row_count - end_row) as f32 * ROW_HEIGHT,
-            )));
-        }
-    }
-
-    container(
-        scrollable(grid.spacing(0))
-            .id(state.catalog_scroll_id.clone())
-            .on_scroll(|viewport| {
-                let offset = viewport.absolute_offset();
-                let bounds = viewport.bounds();
-                Message::CatalogScrolled(offset.y, bounds.height, bounds.width)
-            }),
-    )
-    .padding(18)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(container::rounded_box)
-    .into()
-}
-
-fn catalog_columns(width: f32) -> usize {
-    (((width - 40.0) / 230.0).floor() as usize).clamp(1, 6)
-}
-
-fn visible_catalog_indices(state: &State) -> Vec<usize> {
+fn visible_indices(state: &State) -> Vec<usize> {
     state
         .items
         .iter()
         .enumerate()
-        .filter_map(|(index, _)| {
-            if !state.filter_culling {
-                return Some(index);
-            }
-            state.culling_metrics[index]
-                .filter(|metrics| {
-                    metrics.sharpness >= state.sharpness_threshold
-                        && metrics.clipped_highlights <= state.clipping_threshold
-                })
-                .map(|_| index)
-        })
+        .filter(|(_, item)| state.folder_filter.as_deref().map_or(true, |f| item.path.parent() == Some(f)) && grid::passes_cull(state, item))
+        .map(|(i, _)| i)
         .collect()
 }
 
-fn develop_page(state: &State) -> Element<'_, Message> {
-    let Some(index) = state.selected else {
-        return library_page(state);
-    };
-    let item = &state.items[index];
+// ------------------------------------------------------------------------------------------------
+// Keyboard
+// ------------------------------------------------------------------------------------------------
 
-    if state.loading_photo {
-        return container(
-            column![
-                text("LOADING ASSET").size(12).color(Color::from_rgb8(76, 215, 246)),
-                text(&item.filename).size(20),
-                text("initializing…").size(12),
-            ]
-            .spacing(12)
-            .align_x(Center),
-        )
-        .center(Length::Fill)
+fn subscription(_state: &State) -> Subscription<Message> {
+    Subscription::batch([
+        keyboard::on_key_press(on_key),
+        keyboard::on_key_release(on_key_release),
+        iced::event::listen_with(on_window_event),
+    ])
+}
+
+fn on_key_release(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
+    match key.as_ref() {
+        Key::Character("\\") => Some(Message::Peek(false)),
+        _ => None,
+    }
+}
+
+fn on_window_event(event: iced::Event, _status: iced::event::Status, _id: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::Opened { position, size }) => Some(Message::Ext(ExtMessage::WindowOpened(position, size))),
+        iced::Event::Window(iced::window::Event::Moved(p)) => Some(Message::Ext(ExtMessage::WindowMoved(p))),
+        iced::Event::Window(iced::window::Event::Resized(s)) => Some(Message::Ext(ExtMessage::WindowResized(s))),
+        _ => None,
+    }
+}
+
+fn on_key(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
+    let command = modifiers.command();
+    match key.as_ref() {
+        Key::Named(Named::Tab) => Some(Message::TogglePanel(if modifiers.shift() { Panel::Right } else { Panel::Left })),
+        Key::Named(Named::ArrowLeft) => Some(Message::Step(-1)),
+        Key::Named(Named::ArrowRight) => Some(Message::Step(1)),
+        Key::Named(Named::ArrowUp) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Row(-1)))),
+        Key::Named(Named::ArrowDown) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Row(1)))),
+        Key::Character(c) => match (c, command) {
+            ("e" | "E", true) if modifiers.alt() => Some(Message::Ext(ExtMessage::ExternalOpen)),
+            ("z" | "Z", true) => Some(if modifiers.shift() { Message::Redo } else { Message::Undo }),
+            ("o" | "O", true) => Some(Message::ImportDialog),
+            ("z" | "Z", false) => Some(Message::ToggleZoom),
+            ("j" | "J", false) => Some(Message::ToggleClipping),
+            ("6", false) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Label("Red")))),
+            ("7", false) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Label("Yellow")))),
+            ("8", false) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Label("Green")))),
+            ("9", false) => Some(Message::Ext(ExtMessage::Grid(GridMessage::Label("Blue")))),
+            ("\\", false) => Some(Message::Peek(true)),
+            ("/", false) => Some(Message::TogglePanel(Panel::Filmstrip)),
+            ("p" | "P", false) => Some(Message::Flag("Pick")),
+            ("x" | "X", false) => Some(Message::Flag("Reject")),
+            ("u" | "U", false) => Some(Message::Flag("None")),
+            (d @ ("0" | "1" | "2" | "3" | "4" | "5"), false) => d.parse().ok().map(Message::Rating),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// View — shell
+// ------------------------------------------------------------------------------------------------
+
+pub fn view(state: &State) -> Element<'_, Message> {
+    let body = match state.page {
+        Page::Library => library_page(state),
+        Page::Develop => develop_page(state),
+    };
+    container(column![top_bar(state), h_rule(), body, h_rule(), status_bar(state)])
         .width(Length::Fill)
         .height(Length::Fill)
-        .into();
+        .style(solid(BG_APP))
+        .into()
+}
+
+fn action_button(icon_name: &'static str, text_label: &'static str, msg: Option<Message>) -> Element<'static, Message> {
+    button(
+        row![fa(icon_name, 11.0, TEXT_SECONDARY), label(text_label, 11, TEXT_SECONDARY)]
+            .spacing(5)
+            .align_y(Vertical::Center),
+    )
+    .padding([4, 10])
+    .style(button_style(false, ACCENT))
+    .on_press_maybe(msg)
+    .into()
+}
+
+fn top_bar(state: &State) -> Element<'static, Message> {
+    let tab = |name: &'static str, icon_name: &'static str, page: Page| -> Element<'static, Message> {
+        button(
+            row![fa(icon_name, 11.0, TEXT_PRIMARY), label(name, 12, TEXT_PRIMARY)]
+                .spacing(5)
+                .align_y(Vertical::Center),
+        )
+        .padding([5, 14])
+        .style(button_style(state.page == page, ACCENT))
+        .on_press(Message::Navigate(page))
+        .into()
+    };
+    let can_undo = state.history.active().parent.is_some();
+    let can_redo = !state.history.children(state.history.active_id()).is_empty();
+    let bar = row![
+        label("HALATION", 14, TEXT_PRIMARY),
+        Space::with_width(Length::Fixed(18.0)),
+        tab("Library", "images", Page::Library),
+        tab("Develop", "sliders", Page::Develop),
+        Space::with_width(Length::Fill),
+        mono(format!("{} photos", state.items.len()), 10, TEXT_DIM),
+        action_button("arrow-rotate-left", "Undo", can_undo.then_some(Message::Undo)),
+        action_button("arrow-rotate-right", "Redo", can_redo.then_some(Message::Redo)),
+        action_button("folder-open", "Open Folder…", Some(Message::FolderDialog)),
+        action_button("file-import", "Import…", Some(Message::ImportDialog)),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+    container(bar).padding([8, 14]).width(Length::Fill).style(solid(BG_PANEL)).into()
+}
+
+fn status_bar(state: &State) -> Element<'static, Message> {
+    let right = if state.doc.is_some() {
+        format!("{} · {:.1} ms · {}", if state.used_gpu { "GPU" } else { "CPU" }, state.render_ms, state.gpu.adapter_name)
+    } else {
+        state.gpu.adapter_name.clone()
+    };
+    container(row![label(state.status.clone(), 11, TEXT_SECONDARY), Space::with_width(Length::Fill), mono(right, 10, TEXT_DIM)])
+        .padding([4, 14])
+        .width(Length::Fill)
+        .style(solid(BG_PANEL))
+        .into()
+}
+
+fn develop_page(state: &State) -> Element<'static, Message> {
+    let mut main = Row::new().height(Length::Fill);
+    if state.left_open {
+        main = main.push(left_panel(state)).push(v_rule());
     }
+    main = main.push(center_panel(state));
+    if state.right_open {
+        main = main.push(v_rule()).push(right_panel(state));
+    }
+    let mut page = Column::new().push(main);
+    if state.filmstrip_open {
+        page = page.push(h_rule()).push(filmstrip(state));
+    }
+    page.height(Length::Fill).into()
+}
 
-    let raw = state.raw_assets[index].as_ref();
-    let meta = raw.map(|r| &r.metadata);
-    let exif_stamp = meta
-        .map(|m| {
-            format!(
-                "{} · {} · ISO {} · {} · {}",
-                empty_dash(&m.camera),
-                empty_dash(&m.lens),
-                m.iso.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
-                empty_dash(&m.shutter),
-                empty_dash(&m.aperture)
-            )
-        })
-        .unwrap_or_default();
+// ------------------------------------------------------------------------------------------------
+// View — left panel
+// ------------------------------------------------------------------------------------------------
 
-    // ==========================================
-    // COLUMN 1: LEFT UTILITY DECK (260px)
-    // ==========================================
-    let navigator: Element<'_, Message> = if let Some(handle) = &state.viewport {
-        column![
-            row![
-                text("NAVIGATOR").size(11).color(Color::from_rgb8(76, 215, 246)),
-                Space::with_width(Length::Fill),
-                button(text("FIT").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Fit)),
-                button(text("1:1").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Actual)),
-                button(text("2:1").size(9)).style(button::text).on_press(Message::SetZoom(ZoomMode::Two)),
-            ]
-            .align_y(Center),
-            canvas::Canvas::new(Navigator {
-                handle: handle.clone(),
-                zoom: state.zoom,
-                custom_zoom: state.custom_zoom,
-                pan: state.pan
-            })
-            .width(Length::Fixed(236.0))
-            .height(Length::Fixed(140.0)),
-            text(format!("{} × {} px", state.preview_dimensions.0, state.preview_dimensions.1))
-                .size(9)
-                .color(Color::from_rgb8(150, 152, 156)),
+fn section_block(title: &str, action: Option<Element<'static, Message>>, body: Element<'static, Message>) -> Element<'static, Message> {
+    let mut head = Row::new().align_y(Vertical::Center).push(label(title, 10, TEXT_DIM)).push(Space::with_width(Length::Fill));
+    if let Some(action) = action {
+        head = head.push(action);
+    }
+    column![
+        container(head).padding([6, 12]).width(Length::Fill).style(solid(BG_HEADER)),
+        container(body).padding([8, 10]).width(Length::Fill)
+    ]
+    .into()
+}
+
+fn left_panel(state: &State) -> Element<'static, Message> {
+    let zoom_name = match state.zoom {
+        ZoomMode::Fit => "Fit",
+        ZoomMode::Fill => "Fill",
+        ZoomMode::Actual => "1:1",
+        ZoomMode::Custom => "Zoom",
+    };
+    let nav_body: Element<'static, Message> = match (&state.viewport, state.doc.as_ref()) {
+        (Some(handle), Some(doc)) => container(
+            Navigator { thumbnail: Some(handle.clone()), image_size: doc.full_size, view: state.ext.view, pane: ext::pane_size(state) }.view(LEFT_W - 28.0),
+        )
+        .padding(2)
+        .style(framed(BG_CANVAS, BORDER))
+        .into(),
+        _ => container(label("No image", 11, TEXT_DIM)).padding(14).into(),
+    };
+    let navigator = section_block("NAVIGATOR", Some(mono(zoom_name, 10, TEXT_SECONDARY).into()), nav_body);
+    let content = column![navigator, history_section(state), snapshots_section(state), folders_section(state)];
+    container(scrollable(content).height(Length::Fill))
+        .width(Length::Fixed(LEFT_W))
+        .height(Length::Fill)
+        .style(solid(BG_PANEL))
+        .into()
+}
+
+fn history_section(state: &State) -> Element<'static, Message> {
+    let active = state.history.active_id();
+    let mut list = Column::new().spacing(1);
+    for node in state.history.nodes().iter().rev().take(200) {
+        let current = node.id == active;
+        let color = if current {
+            TEXT_PRIMARY
+        } else if state.history.on_active_path(node.id) {
+            TEXT_SECONDARY
+        } else {
+            TEXT_DIM
+        };
+        let line = row![
+            Space::with_width(Length::Fixed(state.history.lane(node.id) as f32 * 10.0)),
+            label(if current { "●" } else { "○" }, 9, if current { ACCENT } else { TEXT_DIM }),
+            label(node.label.clone(), 11, color),
+            Space::with_width(Length::Fill),
+            mono(node.detail.clone(), 9, TEXT_DIM),
         ]
         .spacing(6)
-        .into()
-    } else {
-        column![text("NAVIGATOR").size(11)].into()
-    };
+        .align_y(Vertical::Center);
+        list = list.push(
+            button(line).width(Length::Fill).padding([4, 8]).style(row_style(current)).on_press(Message::HistoryCheckout(node.id)),
+        );
+    }
+    section_block("HISTORY", None, list.into())
+}
 
-    let history_panel: Element<'_, Message> = {
-        let entries = state.catalog.history(item.id);
-        let active = state.catalog.active_history_id(item.id);
-        let mut list = column![
-            row![
-                text("HISTORY & BRANCHES").size(11).color(Color::from_rgb8(76, 215, 246)),
-                Space::with_width(Length::Fill),
-                text(format!("{} steps", entries.len())).size(9).color(Color::from_rgb8(150, 152, 156)),
-            ]
-            .align_y(Center)
-        ]
-        .spacing(4);
-
-        for entry in entries.into_iter().rev() {
-            let is_active = Some(entry.id) == active;
-            list = list.push(
-                button(
-                    row![
-                        text(if is_active { "●" } else { "○" })
-                            .size(10)
-                            .color(if is_active {
-                                Color::from_rgb8(76, 215, 246)
-                            } else {
-                                Color::from_rgb8(150, 152, 156)
-                            }),
-                        text(entry.label).size(10), // <-- Pass owned String by value
-                    ]
-                    .spacing(6)
-                    .align_y(Center),
-                )
-                .style(if is_active {
-                    button::secondary
-                } else {
-                    button::text
-                })
+fn snapshots_section(state: &State) -> Element<'static, Message> {
+    let add = button(label("+", 12, TEXT_SECONDARY))
+        .padding([0, 7])
+        .style(button_style(false, ACCENT))
+        .on_press_maybe(state.doc.is_some().then_some(Message::SnapshotAdd));
+    let mut list = Column::new().spacing(1);
+    if state.snapshots.is_empty() {
+        list = list.push(label("No snapshots", 11, TEXT_DIM));
+    }
+    for (i, (name, _)) in state.snapshots.iter().enumerate() {
+        list = list.push(
+            button(label(name.clone(), 11, TEXT_SECONDARY))
                 .width(Length::Fill)
-                .on_press(Message::HistorySelect(entry.id)),
-            );
+                .padding([4, 8])
+                .style(row_style(false))
+                .on_press(Message::SnapshotApply(i)),
+        );
+    }
+    section_block("SNAPSHOTS", Some(add.into()), list.into())
+}
+
+fn folders_section(state: &State) -> Element<'static, Message> {
+    let mut counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for item in &state.items {
+        if let Some(parent) = item.path.parent() {
+            *counts.entry(parent.to_path_buf()).or_default() += 1;
         }
-        list.into()
-    };
-
-    let culling_panel: Element<'_, Message> = {
-        let metrics = state.culling_metrics[index];
-        let status_str = metrics
-            .map(|m| {
-                if m.sharpness < state.sharpness_threshold || m.clipped_highlights > state.clipping_threshold {
-                    ("REVIEW REQUIRED", Color::from_rgb8(255, 180, 171))
-                } else {
-                    ("IN FOCUS · BALANCED", Color::from_rgb8(76, 215, 246))
-                }
-            })
-            .unwrap_or(("PENDING METRICS", Color::from_rgb8(150, 152, 156)));
-
-        column![
-            text("CULLING ANALYSIS").size(11).color(Color::from_rgb8(76, 215, 246)),
-            text(status_str.0).size(10).color(status_str.1),
-            text(metrics.map(|m| format!("Laplacian Focus: {:.4}", m.sharpness)).unwrap_or_default())
-                .size(9)
-                .font(Font::MONOSPACE),
-            text(metrics.map(|m| format!("Clipped Highlights: {:.2}%", m.clipped_highlights * 100.0)).unwrap_or_default())
-                .size(9)
-                .font(Font::MONOSPACE),
-            text("Min Sharpness").size(9).color(Color::from_rgb8(150, 152, 156)),
-            slider(0.0001_f32..=0.015_f32, state.sharpness_threshold, Message::SharpnessThreshold)
-                .step(0.0001_f32),
-            text("Max Highlight Clipping").size(9).color(Color::from_rgb8(150, 152, 156)),
-            slider(0.0_f32..=0.20_f32, state.clipping_threshold, Message::ClippingThreshold)
-                .step(0.005_f32),
-        ]
-        .spacing(4)
-        .into()
-    };
-
-    let left_deck = container(
-        scrollable(
-            column![
-                navigator,
-                container(history_panel).padding(8).style(container::rounded_box),
-                container(culling_panel).padding(8).style(container::rounded_box),
-            ]
-            .spacing(12),
-        )
-    )
-    .width(Length::Fixed(260.0))
-    .padding(10)
-    .style(container::rounded_box);
-
-    // ==========================================
-    // COLUMN 2: CENTER STAGE & FILMSTRIP (FILL)
-    // ==========================================
-    let center_toolbar = row![
-        button(text("Loupe").size(10))
-            .style(if state.view_mode == ViewMode::Single { button::secondary } else { button::text })
-            .on_press(Message::SetViewMode(ViewMode::Single)),
-        button(text("Side Split").size(10))
-            .style(if state.view_mode == ViewMode::SplitSideBySide { button::secondary } else { button::text })
-            .on_press(Message::SetViewMode(ViewMode::SplitSideBySide)),
-        button(text("Top Split").size(10))
-            .style(if state.view_mode == ViewMode::SplitTopBottom { button::secondary } else { button::text })
-            .on_press(Message::SetViewMode(ViewMode::SplitTopBottom)),
-        Space::with_width(Length::Fixed(12.0)),
-        button(text(if state.clipping[0] { "▲ Black Clip ON" } else { "▲ Black Clip" }).size(10))
-            .style(if state.clipping[0] { button::secondary } else { button::text })
-            .on_press(Message::ToggleClipping(0)),
-        button(text(if state.clipping[1] { "▼ White Clip ON" } else { "▼ White Clip" }).size(10))
-            .style(if state.clipping[1] { button::danger } else { button::text })
-            .on_press(Message::ToggleClipping(1)),
-        Space::with_width(Length::Fill),
-        if state.view_mode != ViewMode::Single {
-            row![
-                text("Split").size(10),
-                slider(0.1_f32..=0.9_f32, state.divider, Message::Divider).width(Length::Fixed(90.0)),
-            ]
-            .spacing(6)
-            .align_y(Center)
-        } else {
-            row![]
-        },
-    ]
-    .spacing(4)
-    .align_y(Center);
-
-    let viewport: Element<'_, Message> = if let Some(handle) = &state.viewport {
-        match state.view_mode {
-            ViewMode::Single => canvas::Canvas::new(MainViewport {
-                handle: handle.clone(),
-                dimensions: state.preview_dimensions,
-                zoom: state.zoom,
-                custom_zoom: state.custom_zoom,
-                pan: state.pan,
-                mask_overlay: state.mask_overlay.clone(),
-                mask_tool: state.mask_tool,
-            })
+    }
+    let entry = |name: String, count: usize, filter: Option<PathBuf>| -> Element<'static, Message> {
+        let active = state.folder_filter == filter;
+        button(row![label(name, 11, TEXT_SECONDARY), Space::with_width(Length::Fill), mono(count.to_string(), 10, TEXT_DIM)])
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-            ViewMode::SplitSideBySide => {
-                let original = state.original_viewport.as_ref().unwrap_or(handle);
-                row![
-                    container(
-                        image::Viewer::new(original.clone())
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .content_fit(ContentFit::Contain)
-                    )
-                    .width(Length::FillPortion((state.divider * 100.0) as u16)),
-                    container(
-                        image::Viewer::new(handle.clone())
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .content_fit(ContentFit::Contain)
-                    )
-                    .width(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16)),
-                ]
-                .height(Length::Fill)
-                .into()
-            }
-            ViewMode::SplitTopBottom => {
-                let original = state.original_viewport.as_ref().unwrap_or(handle);
-                column![
-                    container(
-                        image::Viewer::new(original.clone())
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .content_fit(ContentFit::Contain)
-                    )
-                    .height(Length::FillPortion((state.divider * 100.0) as u16)),
-                    container(
-                        image::Viewer::new(handle.clone())
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .content_fit(ContentFit::Contain)
-                    )
-                    .height(Length::FillPortion(((1.0 - state.divider) * 100.0) as u16)),
-                ]
-                .width(Length::Fill)
-                .into()
-            }
-        }
-    } else {
-        container(text("Select photo to begin develop").size(12))
-            .center(Length::Fill)
+            .padding([4, 8])
+            .style(row_style(active))
+            .on_press(Message::FolderFilter(filter))
             .into()
     };
+    let mut list = Column::new().spacing(1).push(entry("All photographs".into(), state.items.len(), None));
+    for (dir, count) in counts {
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string());
+        let parent = dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let display = parent.map_or(name.clone(), |p| format!("{p}/{name}"));
+        list = list.push(entry(display, count, Some(dir)));
+    }
+    section_block("FOLDERS", None, list.into())
+}
 
-    let filmstrip: Element<'_, Message> = {
-        let mut row_items = row![].spacing(6).align_y(Center);
-        for (i, it) in state.items.iter().enumerate() {
-            let is_sel = state.selected == Some(i);
-            let thumb: Element<'_, Message> = if let Some(h) = &state.thumbnails[i] {
-                image(h.clone())
-                    .content_fit(ContentFit::Cover)
-                    .width(Length::Fixed(84.0))
-                    .height(Length::Fixed(50.0))
-                    .into()
-            } else {
-                container(
-                    text("No Preview")
-                        .size(8)
-                        .color(Color::from_rgb8(150, 152, 156)),
-                )
-                .width(Length::Fixed(84.0))
-                .height(Length::Fixed(50.0))
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
-                .into()
-            };
+// ------------------------------------------------------------------------------------------------
+// View — center (loupe)
+// ------------------------------------------------------------------------------------------------
 
-            row_items = row_items.push(
-                button(
-                    column![
-                        thumb,
-                        row![
-                            text(format!("#{}", i + 1))
-                                .size(8)
-                                .color(Color::from_rgb8(150, 152, 156)),
-                            Space::with_width(Length::Fixed(8.0)),
-                            text(format!("★{}", it.rating))
-                                .size(8)
-                                .color(Color::from_rgb8(255, 193, 116)),
-                        ]
-                        .width(Length::Fixed(84.0))
-                        .align_y(Center),
-                    ]
-                    .spacing(2)
-                    .align_x(Center),
-                )
-                .width(Length::Fixed(92.0))
-                .height(Length::Fixed(72.0))
-                .padding(3)
-                .style(if is_sel {
-                    button::secondary
-                } else {
-                    button::text
-                })
-                .on_press(Message::Select(i)),
-            );
-        }
+fn center_panel(state: &State) -> Element<'static, Message> {
+    column![
+        container(viewport_view(state)).width(Length::Fill).height(Length::Fill).style(solid(BG_CANVAS)),
+        h_rule(),
+        viewport_toolbar(state),
+        h_rule(),
+        exif_hud(state)
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
 
-        container(
-            column![
-                row![
-                    text("FILMSTRIP DOCK").size(10).color(Color::from_rgb8(76, 215, 246)),
-                    Space::with_width(Length::Fill),
-                    text(format!("{} of {}", index + 1, state.items.len()))
-                        .size(9)
-                        .color(Color::from_rgb8(150, 152, 156)),
-                ]
-                .align_y(Center),
-                scrollable::Scrollable::with_direction(
-                    row_items.height(Length::Fixed(74.0)),
-                    scrollable::Direction::Horizontal(scrollable::Scrollbar::default()),
-                ),
-            ]
-            .spacing(4),
-        )
-        .padding(6)
+fn note(s: &'static str) -> Element<'static, Message> {
+    container(label(s, 13, TEXT_DIM)).width(Length::Fill).height(Length::Fill).align_x(Horizontal::Center).align_y(Vertical::Center).into()
+}
+
+fn empty_state() -> Element<'static, Message> {
+    let body = column![
+        label("No photos yet", 24, TEXT_PRIMARY),
+        label("Import JPEG, PNG, TIFF, WebP or DNG files — originals stay untouched.", 12, TEXT_DIM),
+        row![
+            action_button("file-import", "Import Photos…", Some(Message::ImportDialog)),
+            action_button("folder-open", "Open Folder…", Some(Message::FolderDialog))
+        ]
+        .spacing(8),
+    ]
+    .spacing(12)
+    .align_x(Horizontal::Center);
+    container(body).width(Length::Fill).height(Length::Fill).align_x(Horizontal::Center).align_y(Vertical::Center).into()
+}
+
+fn viewer(handle: image::Handle, fit: ContentFit) -> Element<'static, Message> {
+    image::Viewer::new(handle)
         .width(Length::Fill)
-        .height(Length::Fixed(106.0))
-        .style(container::rounded_box)
+        .height(Length::Fill)
+        .content_fit(fit)
+        .min_scale(1.0)
+        .max_scale(8.0)
+        .scale_step(0.25)
         .into()
-    };
+}
 
-    let center_canvas = column![
-        center_toolbar,
-        container(viewport)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center(Length::Fill)
-            .style(container::rounded_box),
-        text(exif_stamp).size(10).font(Font::MONOSPACE).color(Color::from_rgb8(170, 172, 176)),
-        filmstrip,
+fn pane(content: Element<'static, Message>, caption: &'static str, portion: u16, vertical: bool) -> Element<'static, Message> {
+    let tag = container(label(caption, 9, TEXT_PRIMARY)).padding([2, 6]).style(solid(Color { a: 0.7, ..BG_APP }));
+    let layered = container(stack![content, container(tag).padding(8)]);
+    if vertical {
+        layered.width(Length::Fill).height(Length::FillPortion(portion)).into()
+    } else {
+        layered.width(Length::FillPortion(portion)).height(Length::Fill).into()
+    }
+}
+
+fn canvas_view(state: &State) -> Element<'static, Message> {
+    let Some(edited) = state.viewport.clone() else {
+        return if state.loading.is_some() {
+            note("Loading…")
+        } else if state.items.is_empty() {
+            empty_state()
+        } else {
+            note("Select a photo from the filmstrip")
+        };
+    };
+    let fit = match state.zoom {
+        ZoomMode::Fit | ZoomMode::Custom => ContentFit::Contain,
+        ZoomMode::Fill => ContentFit::Cover,
+        ZoomMode::Actual => ContentFit::None,
+    };
+    let before = state.original.clone().unwrap_or_else(|| edited.clone());
+    let left = (state.divider * 100.0) as u16;
+    let right = ((1.0 - state.divider) * 100.0) as u16;
+    match state.view_mode {
+        ViewMode::Single => viewer(edited, fit),
+        ViewMode::SplitSideBySide => row![
+            pane(viewer(before, ContentFit::Contain), "BEFORE", left, false),
+            v_rule(),
+            pane(viewer(edited, ContentFit::Contain), "AFTER", right, false)
+        ]
+        .height(Length::Fill)
+        .into(),
+        ViewMode::SplitTopBottom => column![
+            pane(viewer(before, ContentFit::Contain), "BEFORE", left, true),
+            h_rule(),
+            pane(viewer(edited, ContentFit::Contain), "AFTER", right, true)
+        ]
+        .width(Length::Fill)
+        .into(),
+        ViewMode::Wipe => row![
+            pane(viewer(before, ContentFit::Contain), "BEFORE", left, false),
+            v_rule(),
+            pane(viewer(edited, ContentFit::Contain), "AFTER", right, false)
+        ]
+        .height(Length::Fill)
+        .into(),
+    }
+}
+
+/// The loupe: canvas viewport once an image is rendered, otherwise the loading / empty-state notes.
+fn viewport_view(state: &State) -> Element<'static, Message> {
+    let (Some(edited), Some(doc)) = (state.viewport.clone(), state.doc.as_ref()) else {
+        return canvas_view(state);
+    };
+    Viewport {
+        edited,
+        before: state.original.clone(),
+        detail: state.ext.detail.as_ref().filter(|(id, _)| *id == doc.id).map(|(_, d)| d.clone()),
+        image_size: doc.full_size,
+        view: state.ext.view,
+        compare: if state.ext.peek { Compare::Peek } else { state.ext.compare },
+        background: BG_CANVAS,
+    }
+    .view()
+}
+
+fn section_header_plain(title: &str) -> Element<'static, Message> {
+    label(title, 10, TEXT_DIM).into()
+}
+
+fn viewport_toolbar(state: &State) -> Element<'static, Message> {
+    let zoom_btn = |name: &'static str, mode: ZoomMode| -> Element<'static, Message> {
+        button(label(name, 11, TEXT_PRIMARY)).padding([3, 9]).style(button_style(state.zoom == mode, ACCENT)).on_press(Message::SetZoom(mode)).into()
+    };
+    let view_btn = |name: &'static str, mode: ViewMode| -> Element<'static, Message> {
+        button(label(name, 11, TEXT_PRIMARY)).padding([3, 9]).style(button_style(state.view_mode == mode, ACCENT)).on_press(Message::SetViewMode(mode)).into()
+    };
+    let mut bar = Row::new()
+        .spacing(5)
+        .align_y(Vertical::Center)
+        .push(zoom_btn("Fit", ZoomMode::Fit))
+        .push(zoom_btn("Fill", ZoomMode::Fill))
+        .push(zoom_btn("1:1", ZoomMode::Actual))
+        .push(Space::with_width(Length::Fixed(14.0)))
+        .push(view_btn("Single", ViewMode::Single))
+        .push(view_btn("Before | After", ViewMode::SplitSideBySide))
+        .push(view_btn("Before / After", ViewMode::SplitTopBottom))
+        .push(view_btn("Wipe", ViewMode::Wipe));
+    if state.view_mode != ViewMode::Single {
+        bar = bar.push(slider(0.2_f32..=0.8_f32, state.divider, Message::Divider).step(0.01_f32).width(Length::Fixed(120.0)));
+    }
+    bar = bar.push(Space::with_width(Length::Fill)).push(mono("Z zoom  ·  \\ compare  ·  scroll to zoom", 10, TEXT_DIM));
+    container(bar).padding([6, 12]).width(Length::Fill).style(solid(BG_PANEL)).into()
+}
+
+fn exif_line(m: &RawMetadata) -> String {
+    let mut parts = Vec::new();
+    if let Some(iso) = m.iso {
+        parts.push(format!("ISO {iso}"));
+    }
+    let lens = if m.lens.is_empty() { m.focal_length.clone() } else { m.lens.clone() };
+    for part in [lens, m.aperture.clone(), m.shutter.clone(), m.camera.clone()] {
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        "No EXIF metadata".to_owned()
+    } else {
+        parts.join("  |  ")
+    }
+}
+
+fn exif_hud(state: &State) -> Element<'static, Message> {
+    let line = state.doc.as_ref().map(|d| exif_line(&d.metadata)).unwrap_or_else(|| "—".to_owned());
+    container(mono(line, 11, TEXT_SECONDARY)).padding([6, 12]).width(Length::Fill).style(solid(BG_PANEL)).into()
+}
+
+// ------------------------------------------------------------------------------------------------
+// View — right panel
+// ------------------------------------------------------------------------------------------------
+
+fn clip_badge(on: bool, color: Color) -> Element<'static, Message> {
+    label("▲", 10, if on { color } else { hex(0x3A3A3A) }).into()
+}
+
+fn histogram_block(state: &State) -> Element<'static, Message> {
+    let (shadows, highlights) = state.histogram.as_ref().map(|h| (h.clipped_shadows(), h.clipped_highlights())).unwrap_or((0.0, 0.0));
+    let head = row![
+        label("HISTOGRAM", 10, TEXT_DIM),
+        Space::with_width(Length::Fill),
+        clip_badge(shadows > 0.001, CLIP_SHADOW),
+        clip_badge(highlights > 0.001, CLIP_HIGHLIGHT)
     ]
     .spacing(6);
+    let value = |id: ParamId| id.get(&state.params);
+    let graph: Element<'static, Message> = HistogramView {
+        data: state.histogram.clone(),
+        values: [value(ParamId::Blacks), value(ParamId::Shadows), value(ParamId::Exposure), value(ParamId::Highlights), value(ParamId::Whites)],
+        clip_overlay: state.ext.clip_overlay,
+    }
+    .view(96.0);
+    let mut info = Column::new().spacing(2);
+    if let Some(doc) = &state.doc {
+        let m = &doc.metadata;
+        info = info
+            .push(label(if m.camera.is_empty() { doc.filename.clone() } else { m.camera.clone() }, 12, TEXT_HEADING))
+            .push(label(if m.lens.is_empty() { "—".to_owned() } else { m.lens.clone() }, 10, TEXT_DIM))
+            .push(mono(
+                format!(
+                    "ISO {}  ·  {}  ·  {}  ·  {}×{}",
+                    m.iso.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                    if m.aperture.is_empty() { "—" } else { &m.aperture },
+                    if m.shutter.is_empty() { "—" } else { &m.shutter },
+                    doc.full_size.0,
+                    doc.full_size.1
+                ),
+                10,
+                TEXT_SECONDARY,
+            ));
+    }
+    container(column![head, graph, info].spacing(8)).padding(12).width(Length::Fill).into()
+}
 
-    // ==========================================
-    // COLUMN 3: RIGHT DEVELOP INSPECTOR (350px)
-    // ==========================================
-    let mut controls = column![
-        row![
-            text("DEVELOP INSPECTOR").size(11).color(Color::from_rgb8(76, 215, 246)),
-            Space::with_width(Length::Fill),
-            text(&item.filename).size(10).font(Font::MONOSPACE),
-        ]
-        .align_y(Center),
+fn tool_rail() -> Element<'static, Message> {
+    let tool = |name: &'static str, msg: Option<Message>| -> Element<'static, Message> {
+        button(label(name, 11, TEXT_PRIMARY))
+            .padding([4, 10])
+            .style(button_style(msg.is_some(), ACCENT))
+            .on_press_maybe(msg)
+            .into()
+    };
+    container(
+        row![tool("Edit", Some(Message::Noop)), tool("Crop", None), tool("Heal", None), tool("Mask", None), tool("Presets", None)].spacing(4),
+    )
+    .padding([8, 12])
+    .width(Length::Fill)
+    .into()
+}
+
+fn param_row(state: &State, id: ParamId) -> Element<'static, Message> {
+    Scrubby::view(id, id.get(&state.params))
+}
+
+fn section_header(state: &State, section: Section) -> Element<'static, Message> {
+    let open = state.sections[section.index()];
+    let modified = section.ids().iter().any(|id| !state.params.is_default_param(*id));
+    let title = row![
+        fa(if open { "chevron-down" } else { "chevron-right" }, 10.0, TEXT_DIM),
+        label(section.title(), 12, TEXT_HEADING),
+        label(if modified { "•" } else { "" }, 12, ACCENT)
     ]
     .spacing(8);
+    let head = button(container(title).width(Length::Fill))
+        .width(Length::Fill)
+        .padding([7, 12])
+        .style(row_style(false))
+        .on_press(Message::ToggleSection(section));
+    let reset = button(fa("rotate-left", 11.0, TEXT_SECONDARY))
+        .padding([6, 8])
+        .style(row_style(false))
+        .on_press_maybe(modified.then_some(Message::ResetSection(section)));
+    container(row![head, reset].align_y(Vertical::Center)).width(Length::Fill).style(solid(BG_HEADER)).into()
+}
 
-    controls = controls.push(
-        histogram::view(state.histogram_data.clone(), state.clipping).map(|output| match output {
-            histogram::Output::Adjust(zone, delta) => Message::HistogramAdjust(zone, delta),
-            histogram::Output::ToggleClipping(idx) => Message::ToggleClipping(idx),
-        }),
-    );
-
-    if let Some(m) = meta {
-        controls = controls.push(
-            row![
-                container(text(format!("ISO {}", m.iso.map(|v| v.to_string()).unwrap_or_else(|| "—".into()))).size(9))
-                    .padding([2, 6])
-                    .style(container::rounded_box),
-                container(text(empty_dash(&m.shutter)).size(9))
-                    .padding([2, 6])
-                    .style(container::rounded_box),
-                container(text(empty_dash(&m.aperture)).size(9))
-                    .padding([2, 6])
-                    .style(container::rounded_box),
-                container(text(empty_dash(&m.lens)).size(9))
-                    .padding([2, 6])
-                    .style(container::rounded_box),
-            ]
-            .spacing(4),
-        );
+fn right_panel(state: &State) -> Element<'static, Message> {
+    let mut controls = Column::new().push(container(label("BASIC", 10, TEXT_DIM)).padding([8, 12]));
+    for section in Section::ALL {
+        controls = controls.push(section_header(state, section));
+        if state.sections[section.index()] {
+            let mut rows = Column::new().spacing(10);
+            for id in section.ids() {
+                rows = rows.push(param_row(state, *id));
+            }
+            controls = controls.push(container(rows).padding(Padding { top: 10.0, right: 12.0, bottom: 14.0, left: 12.0 }));
+        }
     }
-
     controls = controls.push(
-        column![
-            text("AI MASKING (MOBILESAM)").size(10).color(Color::from_rgb8(76, 215, 246)),
+        container(
             row![
-                button(text(if state.mask_tool { "Cancel Point" } else { "Point Mask" }).size(10))
-                    .style(if state.mask_tool { button::secondary } else { button::text })
-                    .on_press(Message::MaskTool(!state.mask_tool)),
-                button(text("Sky").size(10)).style(button::text).on_press(Message::MaskPoint([0.5, 0.1])),
-                button(text("Subject").size(10)).style(button::text).on_press(Message::MaskPoint([0.5, 0.5])),
-                button(text("Clear").size(10)).style(button::text).on_press(Message::ClearMask),
-            ]
-            .spacing(4),
-        ]
-        .spacing(4),
-    );
-
-    controls = controls.push(
-        column![
-            row![
-                text("TONE CURVE").size(10).color(Color::from_rgb8(76, 215, 246)),
-                Space::with_width(Length::Fill),
-                button(text("RGB").size(9)).style(if state.curve_channel == 0 { button::secondary } else { button::text }).on_press(Message::CurveChannel(0)),
-                button(text("R").size(9)).style(if state.curve_channel == 1 { button::secondary } else { button::text }).on_press(Message::CurveChannel(1)),
-                button(text("G").size(9)).style(if state.curve_channel == 2 { button::secondary } else { button::text }).on_press(Message::CurveChannel(2)),
-                button(text("B").size(9)).style(if state.curve_channel == 3 { button::secondary } else { button::text }).on_press(Message::CurveChannel(3)),
-            ]
-            .spacing(2)
-            .align_y(Center),
-            widgets::tone_curve::view(state.curve_points[state.curve_channel].clone())
-                .map(|p| Message::CurvePoint(p.0, p.1)),
-        ]
-        .spacing(4),
-    );
-
-    controls = controls.push(
-        column![
-            text("3-WAY COLOR GRADING").size(10).color(Color::from_rgb8(76, 215, 246)),
-            row![
-                column![
-                    text("Shadows").size(9),
-                    widgets::color_wheel::view(state.wheel_values[0].0, state.wheel_values[0].1)
-                        .map(|v| Message::Wheel(0, v.0, v.1)),
-                    slider(-1.0..=1.0, state.wheel_values[0].2, |v| Message::WheelLuma(0, v)).step(0.02_f32),
-                ]
-                .align_x(Center)
-                .spacing(3),
-                column![
-                    text("Midtones").size(9),
-                    widgets::color_wheel::view(state.wheel_values[1].0, state.wheel_values[1].1)
-                        .map(|v| Message::Wheel(1, v.0, v.1)),
-                    slider(-1.0..=1.0, state.wheel_values[1].2, |v| Message::WheelLuma(1, v)).step(0.02_f32),
-                ]
-                .align_x(Center)
-                .spacing(3),
-                column![
-                    text("Highlights").size(9),
-                    widgets::color_wheel::view(state.wheel_values[2].0, state.wheel_values[2].1)
-                        .map(|v| Message::Wheel(2, v.0, v.1)),
-                    slider(-1.0..=1.0, state.wheel_values[2].2, |v| Message::WheelLuma(2, v)).step(0.02_f32),
-                ]
-                .align_x(Center)
-                .spacing(3),
+                action_button("rotate-left", "Reset all", (!state.params.is_default() && state.doc.is_some()).then_some(Message::ResetAll)),
+                action_button("code-compare", "Before / After", state.doc.is_some().then_some(Message::ToggleComparison))
             ]
             .spacing(8),
-        ]
-        .spacing(4),
+        )
+        .padding(12),
     );
-
-    controls = controls.push(
-        column![
-            text("BASIC CALIBRATION").size(10).color(Color::from_rgb8(76, 215, 246)),
-            control("Temperature", state.params.temperature, 2000.0..=50000.0, 25.0, Message::Temperature),
-            control("Tint", state.params.tint, -150.0..=150.0, 1.0, Message::Tint),
-        ]
-        .spacing(2),
-    );
-
-    controls = controls.push(
-        column![
-            text("TONE DISTRIBUTION").size(10).color(Color::from_rgb8(76, 215, 246)),
-            control("Exposure", state.params.exposure, -5.0..=5.0, 0.05, Message::Exposure),
-            control("Contrast", state.params.contrast, -100.0..=100.0, 1.0, Message::Contrast),
-            control("Highlights", state.params.highlights, -100.0..=100.0, 1.0, Message::Highlights),
-            control("Shadows", state.params.shadows, -100.0..=100.0, 1.0, Message::Shadows),
-            control("Whites", state.params.whites, -100.0..=100.0, 1.0, Message::Whites),
-            control("Blacks", state.params.blacks, -100.0..=100.0, 1.0, Message::Blacks),
-        ]
-        .spacing(2),
-    );
-
-    controls = controls.push(
-        row![
-            text("Rating:").size(10),
-            button(text("1").size(9)).style(button::text).on_press(Message::Rating(1)),
-            button(text("2").size(9)).style(button::text).on_press(Message::Rating(2)),
-            button(text("3").size(9)).style(button::text).on_press(Message::Rating(3)),
-            button(text("4").size(9)).style(button::text).on_press(Message::Rating(4)),
-            button(text("5").size(9)).style(button::text).on_press(Message::Rating(5)),
-            Space::with_width(Length::Fill),
-            button(text("Pick").size(9)).style(button::text).on_press(Message::Flag("Pick")),
-            button(text("Reject").size(9)).style(button::text).on_press(Message::Flag("Reject")),
-        ]
-        .spacing(2)
-        .align_y(Center),
-    );
-
-    controls = controls.push(
-        row![
-            button(text("Reset").size(11))
-                .style(button::text)
-                .on_press(Message::Reset),
-            Space::with_width(Length::Fill),
-            button(text("Save Edits").size(11))
-                .style(button::primary)
-                .on_press(Message::Save),
-        ]
-        .align_y(Center),
-    );
-
-    let right_inspector = container(scrollable(controls.spacing(10)))
-        .width(Length::Fixed(350.0))
-        .padding(12)
-        .style(container::rounded_box);
-
-    row![left_deck, center_canvas, right_inspector]
-        .spacing(6)
+    let body: Element<'static, Message> = match tools::tool_content(state) {
+        Some(tool) => scrollable(tool).height(Length::Fill).into(),
+        None => scrollable(controls).height(Length::Fill).into(),
+    };
+    container(column![histogram_block(state), h_rule(), tools::tool_tabs(state), h_rule(), body])
+        .width(Length::Fixed(RIGHT_W))
         .height(Length::Fill)
+        .style(solid(BG_PANEL))
         .into()
 }
 
-fn control(
-    label: &'static str,
-    value: f32,
-    range: std::ops::RangeInclusive<f32>,
-    step: f32,
-    on_change: fn(f32) -> Message,
-) -> Element<'static, Message> {
-    let min = *range.start();
-    let max = *range.end();
-    let default = if label == "Temperature" { 5500.0 } else { 0.0 };
-    let gradient = match label {
-        "Temperature" => Gradient::Temperature,
-        "Tint" => Gradient::Tint,
-        _ => Gradient::Neutral,
-    };
-    scrubby_slider::view(label, value, min, max, default, step, gradient)
-        .map(move |SliderOutput::Changed(value)| on_change(value))
+// ------------------------------------------------------------------------------------------------
+// View — filmstrip & library
+// ------------------------------------------------------------------------------------------------
+
+fn flag_button(name: &'static str, flag: &'static str, current: &str, color: Color, enabled: bool) -> Element<'static, Message> {
+    button(label(name, 10, TEXT_PRIMARY))
+        .padding([2, 8])
+        .style(button_style(current == flag && flag != "None", color))
+        .on_press_maybe(enabled.then_some(Message::Flag(flag)))
+        .into()
 }
 
-fn empty_dash(s: &str) -> &str {
-    if s.is_empty() {
-        "—"
-    } else {
-        s
-    }
-}
+fn filmstrip(state: &State) -> Element<'static, Message> {
+    let visible = visible_indices(state);
+    let current = state.selected.and_then(|i| state.items.get(i));
+    let rating = current.map(|i| i.rating).unwrap_or(0);
+    let flag = current.map(|i| i.flag.clone()).unwrap_or_default();
+    let enabled = current.is_some();
 
-#[derive(Default)]
-struct CanvasInteraction {
-    dragging: bool,
-    last: Option<Point>,
-}
-
-struct MainViewport {
-    handle: image::Handle,
-    dimensions: (u32, u32),
-    zoom: ZoomMode,
-    custom_zoom: f32,
-    pan: [f32; 2],
-    mask_overlay: Option<image::Handle>,
-    mask_tool: bool,
-}
-
-impl MainViewport {
-    fn display_size(&self, bounds: Size) -> Size {
-        let (width, height) = self.dimensions;
-        if width == 0 || height == 0 {
-            return bounds;
-        }
-        let fit = (bounds.width / width as f32).min(bounds.height / height as f32);
-        let fill = (bounds.width / width as f32).max(bounds.height / height as f32);
-        let scale = match self.zoom {
-            ZoomMode::Fit => fit,
-            ZoomMode::Fill => fill,
-            ZoomMode::Actual => 1.0,
-            ZoomMode::Two => 2.0,
-            ZoomMode::Four => 4.0,
-            ZoomMode::Custom => fit * self.custom_zoom,
-        };
-        Size::new(width as f32 * scale, height as f32 * scale)
-    }
-}
-
-impl canvas::Program<Message> for MainViewport {
-    type State = CanvasInteraction;
-
-    fn update(
-        &self,
-        state: &mut Self::State,
-        event: canvas::Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> (canvas::event::Status, Option<Message>) {
-        match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(
-                button @ (mouse::Button::Left | mouse::Button::Middle),
-            )) => {
-                if self.mask_tool {
-                    if button == mouse::Button::Left {
-                        if let Some(position) = cursor.position_in(bounds) {
-                            let size = self.display_size(bounds.size());
-                            let x = if size.width > bounds.width {
-                                -(size.width - bounds.width) * self.pan[0]
-                            } else {
-                                (bounds.width - size.width) / 2.0
-                            };
-                            let y = if size.height > bounds.height {
-                                -(size.height - bounds.height) * self.pan[1]
-                            } else {
-                                (bounds.height - size.height) / 2.0
-                            };
-                            if position.x >= x
-                                && position.x <= x + size.width
-                                && position.y >= y
-                                && position.y <= y + size.height
-                            {
-                                return (
-                                    canvas::event::Status::Captured,
-                                    Some(Message::MaskPoint([
-                                        (position.x - x) / size.width.max(1.0),
-                                        (position.y - y) / size.height.max(1.0),
-                                    ])),
-                                );
-                            }
-                        }
-                    }
-                    return (canvas::event::Status::Ignored, None);
-                }
-                state.dragging = true;
-                state.last = cursor.position();
-                (canvas::event::Status::Captured, None)
-            }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(
-                mouse::Button::Left | mouse::Button::Middle,
-            )) => {
-                state.dragging = false;
-                state.last = None;
-                (canvas::event::Status::Captured, None)
-            }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                let dimensions = self.display_size(bounds.size());
-                let hidden_x = (dimensions.width - bounds.width).max(1.0);
-                let hidden_y = (dimensions.height - bounds.height).max(1.0);
-                let previous = state.last.replace(position).unwrap_or(position);
-                let delta = position - previous;
-                (
-                    canvas::event::Status::Captured,
-                    Some(Message::PanBy(delta.x / hidden_x, delta.y / hidden_y)),
-                )
-            }
-            canvas::Event::Mouse(mouse::Event::WheelScrolled { delta })
-                if cursor.position_in(bounds).is_some() =>
-            {
-                let y = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => y,
-                    mouse::ScrollDelta::Pixels { y, .. } => y / 100.0,
-                };
-                (
-                    canvas::event::Status::Captured,
-                    Some(Message::WheelZoom(y.signum())),
-                )
-            }
-            _ => (canvas::event::Status::Ignored, None),
-        }
-    }
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &iced::Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        frame.fill_rectangle(
-            Point::ORIGIN,
-            bounds.size(),
-            Color::from_rgb8(35, 36, 39),
+    let mut stars = Row::new().spacing(1);
+    for n in 1..=5u8 {
+        let filled = n <= rating;
+        stars = stars.push(
+            button(if filled {
+                fa("star", 13.0, STAR)
+            } else {
+                fa_regular("star", 13.0, TEXT_DIM)
+            })
+            .padding([0, 2])
+            .style(row_style(false))
+            .on_press_maybe(enabled.then_some(Message::Rating(if rating == n { 0 } else { n }))),
         );
-
-        let size = self.display_size(bounds.size());
-        let x = if size.width > bounds.width {
-            -(size.width - bounds.width) * self.pan[0]
-        } else {
-            (bounds.width - size.width) / 2.0
-        };
-        let y = if size.height > bounds.height {
-            -(size.height - bounds.height) * self.pan[1]
-        } else {
-            (bounds.height - size.height) / 2.0
-        };
-        let image_bounds = Rectangle {
-            x,
-            y,
-            width: size.width,
-            height: size.height,
-        };
-        frame.with_clip(
-            Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: bounds.width,
-                height: bounds.height,
-            },
-            |clipped| {
-                clipped.draw_image(image_bounds, &self.handle);
-                if let Some(mask) = &self.mask_overlay {
-                    clipped.draw_image(image_bounds, mask);
-                }
-            },
-        );
-        vec![frame.into_geometry()]
     }
+    let position = state.selected.and_then(|s| visible.iter().position(|&i| i == s)).map(|p| p + 1).unwrap_or(0);
+    let header = row![
+        stars,
+        Space::with_width(Length::Fixed(10.0)),
+        flag_button("Pick", "Pick", &flag, PICK, enabled),
+        flag_button("Reject", "Reject", &flag, REJECT, enabled),
+        flag_button("Clear", "None", &flag, TEXT_DIM, enabled),
+        Space::with_width(Length::Fill),
+        mono(format!("{position}/{}", visible.len()), 10, TEXT_DIM)
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center);
 
-    fn mouse_interaction(
-        &self,
-        state: &Self::State,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> mouse::Interaction {
-        if state.dragging {
-            mouse::Interaction::Grabbing
-        } else if self.mask_tool {
-            mouse::Interaction::Crosshair
-        } else if {
-            let size = self.display_size(bounds.size());
-            size.width > bounds.width || size.height > bounds.height
-        } {
-            mouse::Interaction::Grab
-        } else {
-            mouse::Interaction::Idle
-        }
+    let mut strip = Row::new().spacing(6).align_y(Vertical::Center);
+    for idx in visible {
+        strip = strip.push(thumb_tile(state, idx));
+    }
+    let scroller = scrollable(strip)
+        .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(5).scroller_width(5)))
+        .width(Length::Fill);
+
+    container(column![container(header).padding([4, 12]), container(scroller).padding([0, 12])].spacing(2))
+        .width(Length::Fill)
+        .height(Length::Fixed(FILMSTRIP_H))
+        .style(solid(BG_PANEL))
+        .into()
+}
+
+fn thumb_picture(state: &State, item: &CatalogItem, width: f32, height: f32) -> Element<'static, Message> {
+    match state.thumbs.get(&item.id) {
+        Some(handle) => image(handle.clone())
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .content_fit(ContentFit::Contain)
+            .into(),
+        None => container(label(if state.thumb_failed.contains(&item.id) { "No preview" } else { "…" }, 9, TEXT_DIM))
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height))
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .style(solid(BG_INPUT))
+            .into(),
     }
 }
 
-struct Navigator {
-    handle: image::Handle,
-    zoom: ZoomMode,
-    custom_zoom: f32,
-    pan: [f32; 2],
+fn flag_chip(flag: &str) -> Option<Element<'static, Message>> {
+    match flag {
+        "Pick" => Some(chip("P", PICK)),
+        "Reject" => Some(chip("R", REJECT)),
+        _ => None,
+    }
 }
 
-impl canvas::Program<Message> for Navigator {
-    type State = CanvasInteraction;
+fn thumb_tile(state: &State, idx: usize) -> Element<'static, Message> {
+    let item = &state.items[idx];
+    let mut caption = Row::new().align_y(Vertical::Center).width(Length::Fixed(96.0));
+    caption = caption.push(label("★".repeat(item.rating as usize), 9, STAR)).push(Space::with_width(Length::Fill));
+    if let Some(c) = flag_chip(&item.flag) {
+        caption = caption.push(c);
+    }
+    button(column![thumb_picture(state, item, 96.0, 58.0), caption].spacing(3))
+        .padding(4)
+        .style(tile_style(state.selected == Some(idx)))
+        .on_press(Message::Select(idx))
+        .into()
+}
 
-    fn update(
-        &self,
-        state: &mut Self::State,
-        event: canvas::Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> (canvas::event::Status, Option<Message>) {
-        match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.dragging = true;
-                if let Some(p) = cursor.position_in(bounds) {
-                    (
-                        canvas::event::Status::Captured,
-                        Some(Message::PanTo(
-                            (p.x / bounds.width).clamp(0.0, 1.0),
-                            (p.y / bounds.height).clamp(0.0, 1.0),
-                        )),
+fn library_page(state: &State) -> Element<'static, Message> {
+    if state.items.is_empty() {
+        return empty_state();
+    }
+    grid::grid_page(state)
+}
+
+#[allow(dead_code)]
+fn library_list(state: &State) -> Element<'static, Message> {
+    let mut list = Column::new().spacing(4);
+    for idx in visible_indices(state) {
+        let item = &state.items[idx];
+        let selected = state.selected == Some(idx);
+        let mut line = Row::new()
+            .spacing(12)
+            .align_y(Vertical::Center)
+            .push(thumb_picture(state, item, 72.0, 48.0))
+            .push(
+                column![
+                    label(item.filename.clone(), 13, TEXT_PRIMARY),
+                    mono(
+                        format!(
+                            "{:.1} MB  ·  {}",
+                            item.file_size as f32 / 1_000_000.0,
+                            item.path.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                        ),
+                        10,
+                        TEXT_DIM
                     )
-                } else {
-                    (canvas::event::Status::Ignored, None)
-                }
-            }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                let x = (position.x - bounds.x).clamp(0.0, bounds.width);
-                let y = (position.y - bounds.y).clamp(0.0, bounds.height);
-                (
-                    canvas::event::Status::Captured,
-                    Some(Message::PanTo(
-                        (x / bounds.width).clamp(0.0, 1.0),
-                        (y / bounds.height).clamp(0.0, 1.0),
-                    )),
-                )
-            }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.dragging = false;
-                (canvas::event::Status::Captured, None)
-            }
-            _ => (canvas::event::Status::Ignored, None),
+                ]
+                .spacing(3),
+            )
+            .push(Space::with_width(Length::Fill))
+            .push(label("★".repeat(item.rating as usize), 12, STAR));
+        if let Some(c) = flag_chip(&item.flag) {
+            line = line.push(c);
         }
+        list = list.push(button(line).width(Length::Fill).padding(6).style(row_style(selected)).on_press(Message::Select(idx)));
     }
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &iced::Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let image_rect = Rectangle {
-            x: 0.0,
-            y: 0.0,
-            width: bounds.width,
-            height: bounds.height,
-        };
-        frame.draw_image(image_rect, &self.handle);
-        let visible = match self.zoom {
-            ZoomMode::Fit => 1.0,
-            ZoomMode::Fill => 0.78,
-            ZoomMode::Actual => 0.36,
-            ZoomMode::Two => 0.18,
-            ZoomMode::Four => 0.09,
-            ZoomMode::Custom => (1.0 / self.custom_zoom.max(1.0)).max(0.09),
-        };
-        let width = (bounds.width * visible).max(20.0).min(bounds.width);
-        let height = (bounds.height * visible).max(14.0).min(bounds.height);
-        let x = (bounds.width - width) * self.pan[0];
-        let y = (bounds.height - height) * self.pan[1];
-        frame.stroke_rectangle(
-            Point::new(x, y),
-            Size::new(width, height),
-            canvas::Stroke::default()
-                .with_color(Color::from_rgb8(76, 215, 246))
-                .with_width(2.0),
-        );
-        vec![frame.into_geometry()]
-    }
-
-    fn mouse_interaction(
-        &self,
-        state: &Self::State,
-        _bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> mouse::Interaction {
-        if state.dragging {
-            mouse::Interaction::Grabbing
-        } else {
-            mouse::Interaction::Grab
-        }
-    }
+    container(scrollable(column![label("PHOTO LIBRARY", 11, TEXT_DIM), list].spacing(10)))
+        .padding(24)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }

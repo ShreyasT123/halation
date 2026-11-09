@@ -6,6 +6,5 @@ edition.workspace = true
 [dependencies]
 wgpu = { workspace = true }
 halation-core = { workspace = true }
-halation-color = { workspace = true }
 bytemuck = { workspace = true }
-pollster = "1.0.1"
+pollster = { workspace = true }

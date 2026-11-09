@@ -1611,25 +1611,31 @@ dependencies = [
  "blake3",
  "halation-core",
  "halation-raw",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "windows 0.58.0",
 ]
 
 [[package]]
 name = "halation-color"
 version = "0.1.0"
 dependencies = [
- "moxcms 0.9.1",
+ "glam",
+ "halation-core",
  "windows 0.58.0",
+ "x11rb",
 ]
 
 [[package]]
 name = "halation-core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1649,7 +1655,6 @@ name = "halation-gpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "halation-color",
  "halation-core",
  "pollster 1.0.1",
  "wgpu 23.0.1",
@@ -1659,20 +1664,23 @@ dependencies = [
 name = "halation-ml"
 version = "0.1.0"
 dependencies = [
- "image 0.25.10",
+ "halation-core",
  "ort",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "halation-pipeline"
 version = "0.1.0"
 dependencies = [
- "blake3",
+ "ab_glyph",
  "halation-color",
  "halation-core",
  "halation-gpu",
  "halation-raw",
  "image 0.25.10",
+ "lru",
+ "lz4_flex",
  "rayon",
 ]
 
@@ -1698,6 +1706,7 @@ dependencies = [
  "halation-pipeline",
  "halation-raw",
  "iced",
+ "iced_font_awesome",
  "rfd",
  "tokio",
 ]
@@ -1738,6 +1747,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash",
 ]
 
@@ -1822,6 +1833,17 @@ dependencies = [
  "smol_str",
  "thiserror 1.0.69",
  "web-time",
+]
+
+[[package]]
+name = "iced_font_awesome"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5ee7930141f0c5e0919fb70202610735fd46e43da2d7927f6f4dc657956865b"
+dependencies = [
+ "iced",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2106,7 +2128,7 @@ dependencies = [
  "bytemuck",
  "byteorder-lite",
  "image-webp",
- "moxcms 0.8.1",
+ "moxcms",
  "num-traits",
  "png 0.18.1",
  "tiff 0.11.3",
@@ -2416,6 +2438,9 @@ name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lyon"
@@ -2467,6 +2492,15 @@ dependencies = [
  "float_next_after",
  "lyon_path",
  "num-traits",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -2566,16 +2600,6 @@ name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
-dependencies = [
- "num-traits",
- "pxfm",
-]
-
-[[package]]
-name = "moxcms"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "396077b717181ce3f9a6b66739b269b82d756be5ec0f76be0bc40a7c51775830"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -4578,6 +4602,12 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

@@ -1,296 +1,313 @@
-use halation_core::{DevelopParameters, HistogramData};
+//! halation-pipeline — frame scheduler.
+//!
+//! `process_buffer` resolves the develop parameters into one `PreparedDevelop`, then renders the frame
+//! on the GPU (the same maths, in WGSL) and falls back to a Rayon-parallel CPU render when no usable
+//! adapter exists. The CPU path and the shader are driven by the same prepared constants, so both
+//! produce the same picture.
+//!
+//! Cargo: `rayon`, `halation-core`, `halation-color`, `halation-gpu`, `halation-raw`.
+
+use halation_color::{sample_mask, DevelopInputs, DisplayLut, DisplayProfile, PreparedDevelop};
+use halation_core::{
+    DevelopParameters, GpuDevelopMatrices, GpuDevelopUniforms, GpuExtraUniforms, GpuFrameInputs, GpuMat3x3, HistogramData,
+    ImageBufferF32, LutBuffer, MaskBuffer,
+};
 use halation_gpu::GpuDevelopEngine;
 use halation_raw::RawAsset;
 use rayon::prelude::*;
-use std::{
-    collections::{HashMap, VecDeque},
-    io::Cursor,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
-pub struct ThumbnailCache {
-    root: PathBuf,
-    capacity: usize,
-    memory: Mutex<(HashMap<[u8; 32], Arc<Vec<u8>>>, VecDeque<[u8; 32]>)>,
-}
+pub mod culling;
+pub mod export;
+pub mod external;
+pub mod thumbs;
 
-impl ThumbnailCache {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            capacity: 500,
-            memory: Mutex::new((HashMap::new(), VecDeque::new())),
-        }
-    }
-
-    pub fn get_or_create(&self, source: &Path) -> Result<Arc<Vec<u8>>, String> {
-        let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(source.to_string_lossy().as_bytes());
-        hasher.update(&metadata.len().to_le_bytes());
-        hasher.update(&mtime.to_le_bytes());
-        let key = *hasher.finalize().as_bytes();
-
-        {
-            let mut cache = self.memory.lock().map_err(|e| e.to_string())?;
-            if let Some(value) = cache.0.get(&key).cloned() {
-                cache.1.retain(|entry| entry != &key);
-                cache.1.push_back(key);
-                return Ok(value);
-            }
-        }
-        std::fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
-        let disk_path = self
-            .root
-            .join(format!("{}.webp", blake3::Hash::from_bytes(key).to_hex()));
-        let bytes = if disk_path.is_file() {
-            std::fs::read(&disk_path).map_err(|e| e.to_string())?
-        } else {
-            let decoded = image::open(source).map_err(|e| e.to_string())?;
-            let thumb = decoded.thumbnail(256, 256).to_rgb8();
-            let mut encoded = Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgb8(thumb)
-                .write_to(&mut encoded, image::ImageFormat::WebP)
-                .map_err(|e| e.to_string())?;
-            let bytes = encoded.into_inner();
-            std::fs::write(&disk_path, &bytes).map_err(|e| e.to_string())?;
-            bytes
-        };
-        let value = Arc::new(bytes);
-        let mut cache = self.memory.lock().map_err(|e| e.to_string())?;
-        cache.0.insert(key, value.clone());
-        cache.1.retain(|entry| entry != &key);
-        cache.1.push_back(key);
-        while cache.1.len() > self.capacity {
-            if let Some(oldest) = cache.1.pop_front() {
-                cache.0.remove(&oldest);
-            }
-        }
-        Ok(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CullingMetrics {
-    pub sharpness: f32,
-    pub clipped_highlights: f32,
-}
-
-pub fn analyze_for_culling(raw: &RawAsset) -> CullingMetrics {
-    let width = raw.buffer.width as usize;
-    let height = raw.buffer.height as usize;
-    if width < 3 || height < 3 || raw.buffer.pixels.len() < width * height {
-        return CullingMetrics::default();
-    }
-    let gray: Vec<f32> = raw
-        .buffer
-        .pixels
-        .iter()
-        .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
-        .collect();
-    let interior = (width - 2) * (height - 2);
-    let (lap_sum, lap_sq, clipped) = (1..height - 1)
-        .into_par_iter()
-        .map(|y| {
-            let (mut sum, mut square, mut clipped) = (0.0_f64, 0.0_f64, 0_u64);
-            for x in 1..width - 1 {
-                let i = y * width + x;
-                let lap =
-                    gray[i - 1] + gray[i + 1] + gray[i - width] + gray[i + width] - 4.0 * gray[i];
-                sum += lap as f64;
-                square += (lap as f64) * (lap as f64);
-                let p = raw.buffer.pixels[i];
-                clipped += u64::from(p[0] >= 0.995 || p[1] >= 0.995 || p[2] >= 0.995);
-            }
-            (sum, square, clipped)
-        })
-        .reduce(|| (0.0, 0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-    let n = interior as f64;
-    CullingMetrics {
-        sharpness: ((lap_sq / n) - (lap_sum / n).powi(2)).max(0.0) as f32,
-        clipped_highlights: clipped as f32 / interior as f32,
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ExportFormat {
-    Jpeg,
-    Png,
-    WebP,
-    Tiff,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExportJob {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub params: DevelopParameters,
-}
-
-pub fn export_batch(jobs: &[ExportJob], format: ExportFormat) -> Vec<Result<PathBuf, String>> {
-    jobs.par_iter()
-        .map(|job| {
-            let raw = halation_raw::decode_file(&job.source).map_err(|e| e.to_string())?;
-            let output = process_frame(&raw, &job.params);
-            let rgba = image::RgbaImage::from_raw(
-                raw.buffer.width,
-                raw.buffer.height,
-                output.display_rgba,
-            )
-            .ok_or_else(|| "develop pipeline returned an invalid pixel buffer".to_owned())?;
-            let image = image::DynamicImage::ImageRgba8(rgba);
-            let image_format = match format {
-                ExportFormat::Jpeg => image::ImageFormat::Jpeg,
-                ExportFormat::Png => image::ImageFormat::Png,
-                ExportFormat::WebP => image::ImageFormat::WebP,
-                ExportFormat::Tiff => image::ImageFormat::Tiff,
-            };
-            if let Some(parent) = job.destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            image
-                .save_with_format(&job.destination, image_format)
-                .map_err(|e| e.to_string())?;
-            Ok(job.destination.clone())
-        })
-        .collect()
-}
+pub const HISTOGRAM_WIDTH: u32 = 512;
+pub const HISTOGRAM_HEIGHT: u32 = 128;
 
 pub struct PipelineOutput {
+    pub width: u32,
+    pub height: u32,
+    /// sRGB-encoded 8-bit RGBA, row-major, `width * height * 4` bytes.
     pub display_rgba: Vec<u8>,
     pub histogram: HistogramData,
+    /// `HISTOGRAM_WIDTH × HISTOGRAM_HEIGHT` RGBA bitmap of `histogram`.
     pub histogram_rgba: Vec<u8>,
-    pub gpu_used: bool,
+    pub used_gpu: bool,
+}
+
+pub fn develop_inputs(p: &DevelopParameters) -> DevelopInputs {
+    DevelopInputs {
+        exposure: p.exposure,
+        contrast: p.contrast,
+        highlights: p.highlights,
+        shadows: p.shadows,
+        whites: p.whites,
+        blacks: p.blacks,
+        temperature: p.temperature,
+        tint: p.tint,
+        vibrance: p.vibrance,
+        saturation: p.saturation,
+    }
+}
+
+/// Monitor transform shared by both back ends: the LUT object drives the CPU path, the texel buffer
+/// is uploaded once by the GPU engine (cached by `buffer.id`).
+#[derive(Debug)]
+pub struct DisplayTransform {
+    pub lut: Arc<DisplayLut>,
+    pub buffer: LutBuffer,
+}
+
+impl DisplayTransform {
+    pub fn from_profile(profile: &DisplayProfile) -> Self {
+        let lut = Arc::new(DisplayLut::build(profile));
+        let buffer = LutBuffer::new(lut.size as u32, lut.rgba32f());
+        Self { lut, buffer }
+    }
+
+    pub fn srgb() -> Self {
+        Self::from_profile(&DisplayProfile::srgb())
+    }
+
+    pub fn description(&self) -> &str {
+        &self.lut.description
+    }
+}
+
+/// Everything besides image and parameters that influences a render.
+#[derive(Clone)]
+pub struct RenderContext {
+    pub display: Option<Arc<DisplayTransform>>,
+    pub mask: Option<Arc<MaskBuffer>>,
+    pub dither: bool,
+    /// Paint clipped shadows blue and clipped highlights red (histogram corner triangles / `J`).
+    pub clip_overlay: bool,
+}
+
+impl Default for RenderContext {
+    fn default() -> Self {
+        Self { display: None, mask: None, dither: true, clip_overlay: false }
+    }
+}
+
+fn gpu_matrices(prepared: &PreparedDevelop) -> GpuDevelopMatrices {
+    GpuDevelopMatrices {
+        white_balance: GpuMat3x3::from_columns(prepared.wb_columns()),
+        to_display: GpuMat3x3::from_columns(prepared.display_columns()),
+    }
 }
 
 pub fn process_frame(raw: &RawAsset, params: &DevelopParameters) -> PipelineOutput {
-    process_frame_with_gpu(raw, params, None)
+    process_buffer(&raw.buffer, params, None)
 }
 
-pub fn process_frame_with_gpu(
-    raw: &RawAsset,
+pub fn process_frame_with_gpu(raw: &RawAsset, params: &DevelopParameters, gpu: Option<&GpuDevelopEngine>) -> PipelineOutput {
+    process_buffer(&raw.buffer, params, gpu)
+}
+
+pub fn process_buffer(buffer: &ImageBufferF32, params: &DevelopParameters, gpu: Option<&GpuDevelopEngine>) -> PipelineOutput {
+    process_with_context(buffer, params, gpu, &RenderContext::default())
+}
+
+/// Full-featured render: sliders, tone curves, grading wheels, local mask and display LUT.
+pub fn process_with_context(
+    buffer: &ImageBufferF32,
     params: &DevelopParameters,
     gpu: Option<&GpuDevelopEngine>,
+    ctx: &RenderContext,
 ) -> PipelineOutput {
-    if let Some(display_rgba) = gpu.and_then(|engine| engine.process(&raw.buffer, params).ok()) {
-        return finish_frame(display_rgba, true);
+    if !buffer.is_valid() {
+        let display_rgba = vec![0, 0, 0, 255];
+        let histogram = HistogramData::from_rgba8(&display_rgba);
+        let histogram_rgba = render_histogram_bitmap(&histogram, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT);
+        return PipelineOutput { width: 1, height: 1, display_rgba, histogram, histogram_rgba, used_gpu: false };
     }
-    let exp_mult = 2.0_f32.powf(params.exposure);
-    let white_balance = halation_color::white_balance_matrix(params.temperature, params.tint);
-
-    let prepared_curves: [halation_color::PreparedCurve; 4] = if params.tone_curve.len() >= 20 {
-        std::array::from_fn(|i| {
-            halation_color::PreparedCurve::new(&params.tone_curve[i * 5..i * 5 + 5])
-        })
-    } else {
-        std::array::from_fn(|_| halation_color::PreparedCurve::new(&[]))
+    let mask = ctx.mask.as_deref().filter(|m| m.is_valid());
+    let prepared = PreparedDevelop::from_params(params, mask.is_some())
+        .with_display_lut(ctx.display.as_ref().map(|d| d.lut.clone()));
+    let gpu_frame = gpu.and_then(|engine| {
+        let (segments, counts) = params.curve.gpu_segments();
+        let frame = GpuFrameInputs {
+            uniforms: GpuDevelopUniforms::from_params(params, counts.iter().sum()),
+            matrices: gpu_matrices(&prepared),
+            extra: GpuExtraUniforms::build(params, counts, ctx.display.is_some(), ctx.dither, mask.is_some(), ctx.clip_overlay),
+            segments: &segments,
+            lut: ctx.display.as_deref().map(|d| &d.buffer),
+            mask,
+        };
+        engine.process(buffer, &frame).ok()
+    });
+    let (display_rgba, used_gpu) = match gpu_frame {
+        Some(rgba) => (rgba, true),
+        None => (render_cpu(buffer, &prepared, mask, ctx.clip_overlay), false),
     };
-    let wheel_tints = halation_color::calculate_wheel_tints(&params.color_grading);
-    let pixels = &raw.buffer.pixels;
-
-    let processed_pixels: Vec<[u8; 3]> = pixels
-        .par_iter()
-        .map(|rgb| {
-            let mut c = [rgb[0] * exp_mult, rgb[1] * exp_mult, rgb[2] * exp_mult];
-            c = halation_color::apply_matrix(white_balance, c);
-            c = halation_color::apply_highlights_shadows(c, params.highlights, params.shadows);
-            c = halation_color::apply_whites_blacks(c, params.whites, params.blacks);
-            c = halation_color::apply_contrast(c, params.contrast);
-            c = halation_color::apply_curves_and_color_grading(
-                c,
-                &prepared_curves,
-                &wheel_tints,
-                &params.color_grading,
-            );
-
-            [
-                (c[0] * 255.0).round() as u8,
-                (c[1] * 255.0).round() as u8,
-                (c[2] * 255.0).round() as u8,
-            ]
-        })
-        .collect();
-
-    let mut display_rgba = Vec::with_capacity(processed_pixels.len() * 4);
-    let mut histogram = HistogramData::default();
-
-    for p in &processed_pixels {
-        display_rgba.push(p[0]);
-        display_rgba.push(p[1]);
-        display_rgba.push(p[2]);
-        display_rgba.push(255);
-
-        histogram.r[p[0] as usize] += 1;
-        histogram.g[p[1] as usize] += 1;
-        histogram.b[p[2] as usize] += 1;
-    }
-
-    finish_frame_with_histogram(display_rgba, histogram, false)
+    let histogram = histogram_parallel(&display_rgba);
+    let histogram_rgba = render_histogram_bitmap(&histogram, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT);
+    PipelineOutput { width: buffer.width, height: buffer.height, display_rgba, histogram, histogram_rgba, used_gpu }
 }
 
-fn finish_frame(display_rgba: Vec<u8>, gpu_used: bool) -> PipelineOutput {
-    let mut histogram = HistogramData::default();
-    for pixel in display_rgba.chunks_exact(4) {
-        histogram.r[pixel[0] as usize] += 1;
-        histogram.g[pixel[1] as usize] += 1;
-        histogram.b[pixel[2] as usize] += 1;
-    }
-    finish_frame_with_histogram(display_rgba, histogram, gpu_used)
-}
-
-fn finish_frame_with_histogram(
-    display_rgba: Vec<u8>,
-    histogram: HistogramData,
-    gpu_used: bool,
-) -> PipelineOutput {
-    let histogram_rgba = render_histogram_bitmap(&histogram, 256, 64);
-    PipelineOutput {
-        display_rgba,
-        histogram,
-        histogram_rgba,
-        gpu_used,
-    }
-}
-
-fn render_histogram_bitmap(hist: &HistogramData, width: u32, height: u32) -> Vec<u8> {
-    let mut bmp = vec![25; (width * height * 4) as usize];
-    let max_count = hist
-        .r
-        .iter()
-        .chain(&hist.g)
-        .chain(&hist.b)
-        .cloned()
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    for x in 0..width {
-        let r_h = ((hist.r[x as usize] as f32 / max_count as f32) * (height - 1) as f32) as u32;
-        let g_h = ((hist.g[x as usize] as f32 / max_count as f32) * (height - 1) as f32) as u32;
-        let b_h = ((hist.b[x as usize] as f32 / max_count as f32) * (height - 1) as f32) as u32;
-
-        for y in 0..height {
-            let inv_y = height - 1 - y;
-            let idx = ((y * width + x) * 4) as usize;
-
-            let in_r = inv_y <= r_h;
-            let in_g = inv_y <= g_h;
-            let in_b = inv_y <= b_h;
-
-            if in_r || in_g || in_b {
-                bmp[idx] = if in_r { 220 } else { 0 };
-                bmp[idx + 1] = if in_g { 220 } else { 0 };
-                bmp[idx + 2] = if in_b { 220 } else { 0 };
-                bmp[idx + 3] = 255;
+fn render_cpu(buffer: &ImageBufferF32, prepared: &PreparedDevelop, mask: Option<&MaskBuffer>, clip_overlay: bool) -> Vec<u8> {
+    let (w, h) = (buffer.width as usize, buffer.height as usize);
+    let mut rgba = vec![255u8; buffer.pixels.len() * 4];
+    rgba.par_chunks_exact_mut(w * 4).zip(buffer.pixels.par_chunks_exact(w)).enumerate().for_each(|(y, (out_row, in_row))| {
+        let v = (y as f32 + 0.5) / h as f32;
+        for (x, (out, px)) in out_row.chunks_exact_mut(4).zip(in_row).enumerate() {
+            let m = match mask {
+                Some(mask) if prepared.has_local() => sample_mask(mask, (x as f32 + 0.5) / w as f32, v),
+                _ => 0.0,
+            };
+            let mut c = prepared.develop_srgb8_masked(*px, m);
+            if clip_overlay {
+                if c.iter().any(|&v| v >= 254) {
+                    c = [255, 34, 34];
+                } else if c.iter().any(|&v| v <= 1) {
+                    c = [34, 85, 255];
+                }
             }
+            out[..3].copy_from_slice(&c);
+        }
+    });
+    rgba
+}
+
+/// Copy the normalised rectangle `[x, y, w, h]` out of a full-resolution buffer (longest side capped
+/// at `max_dim`, keeping the rectangle's centre). Returns the cropped buffer and the normalised
+/// rectangle it actually covers, which the loupe uses to place it exactly over the preview.
+pub fn crop_region(buffer: &ImageBufferF32, rect: [f32; 4], max_dim: u32) -> (ImageBufferF32, [f32; 4]) {
+    let (w, h) = (buffer.width as f32, buffer.height as f32);
+    let mut px = [rect[0] * w, rect[1] * h, rect[2] * w, rect[3] * h];
+    let cap = max_dim.max(1) as f32;
+    for k in 0..2 {
+        if px[2 + k] > cap {
+            px[k] += (px[2 + k] - cap) * 0.5;
+            px[2 + k] = cap;
+        }
+    }
+    let x0 = (px[0].floor().max(0.0) as u32).min(buffer.width.saturating_sub(1));
+    let y0 = (px[1].floor().max(0.0) as u32).min(buffer.height.saturating_sub(1));
+    let cw = ((px[2].ceil() as u32).max(1)).min(buffer.width - x0);
+    let ch = ((px[3].ceil() as u32).max(1)).min(buffer.height - y0);
+    let mut out = Vec::with_capacity((cw * ch) as usize);
+    for y in y0..y0 + ch {
+        let row = (y * buffer.width + x0) as usize;
+        out.extend_from_slice(&buffer.pixels[row..row + cw as usize]);
+    }
+    let covered = [x0 as f32 / w, y0 as f32 / h, cw as f32 / w, ch as f32 / h];
+    (ImageBufferF32::new(cw, ch, out), covered)
+}
+
+fn merge(mut a: HistogramData, b: HistogramData) -> HistogramData {
+    for i in 0..256 {
+        a.r[i] += b.r[i];
+        a.g[i] += b.g[i];
+        a.b[i] += b.b[i];
+        a.luma[i] += b.luma[i];
+    }
+    a
+}
+
+fn histogram_parallel(rgba: &[u8]) -> HistogramData {
+    rgba.par_chunks(1 << 18).map(HistogramData::from_rgba8).reduce(HistogramData::default, merge)
+}
+
+/// RGB histogram: additive per-channel fills (overlaps read as white), luminance outline, quarter
+/// grid lines, and blue / red edge markers when shadows / highlights clip.
+pub fn render_histogram_bitmap(hist: &HistogramData, width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut bmp = vec![0u8; w * h * 4];
+    let peak = hist.peak() as f32;
+    let column = |counts: &[u32; 256], x: usize| -> usize {
+        let v = (counts[x * 256 / w] as f32 / peak).min(1.0).powf(0.7);
+        (v * (h - 1) as f32) as usize
+    };
+    let (clip_lo, clip_hi) = (hist.clipped_shadows() > 0.001, hist.clipped_highlights() > 0.001);
+    for x in 0..w {
+        let (rh, gh, bh, lh) = (column(&hist.r, x), column(&hist.g, x), column(&hist.b, x), column(&hist.luma, x));
+        let grid = x > 0 && x % (w / 4) == 0;
+        for y in 0..h {
+            let up = h - 1 - y;
+            let mut px = if grid { [44i32; 3] } else { [28i32; 3] };
+            if up <= rh {
+                px[0] += 110;
+            }
+            if up <= gh {
+                px[1] += 110;
+            }
+            if up <= bh {
+                px[2] += 110;
+            }
+            if up == lh || up + 1 == lh {
+                px = [215; 3];
+            }
+            if clip_lo && x < 3 {
+                px = [34, 85, 255];
+            }
+            if clip_hi && x + 3 >= w {
+                px = [255, 34, 34];
+            }
+            let i = (y * w + x) * 4;
+            bmp[i] = px[0].clamp(0, 255) as u8;
+            bmp[i + 1] = px[1].clamp(0, 255) as u8;
+            bmp[i + 2] = px[2].clamp(0, 255) as u8;
+            bmp[i + 3] = 255;
         }
     }
     bmp
+}
+
+/// Area-averaged (box filter) downscale in linear light so the interactive preview stays photometrically
+/// correct. Buffers already within `max_dim` are returned unchanged.
+pub fn make_preview(buffer: &ImageBufferF32, max_dim: u32) -> ImageBufferF32 {
+    let (w, h) = (buffer.width as u64, buffer.height as u64);
+    let longest = w.max(h);
+    if longest <= max_dim as u64 || !buffer.is_valid() {
+        return buffer.clone();
+    }
+    let scale = longest as f64 / max_dim as f64;
+    let tw = ((w as f64 / scale).round() as u64).max(1);
+    let th = ((h as f64 / scale).round() as u64).max(1);
+    let mut out = vec![[0.0f32; 3]; (tw * th) as usize];
+    out.par_chunks_mut(tw as usize).enumerate().for_each(|(oy, row)| {
+        let y0 = (oy as u64 * h / th) as usize;
+        let y1 = (((oy as u64 + 1) * h).div_ceil(th) as usize).clamp(y0 + 1, h as usize);
+        for (ox, px) in row.iter_mut().enumerate() {
+            let x0 = (ox as u64 * w / tw) as usize;
+            let x1 = (((ox as u64 + 1) * w).div_ceil(tw) as usize).clamp(x0 + 1, w as usize);
+            let mut acc = [0.0f32; 3];
+            for sy in y0..y1 {
+                let base = sy * w as usize;
+                for p in &buffer.pixels[base + x0..base + x1] {
+                    acc[0] += p[0];
+                    acc[1] += p[1];
+                    acc[2] += p[2];
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as f32;
+            *px = [acc[0] / n, acc[1] / n, acc[2] / n];
+        }
+    });
+    ImageBufferF32::new(tw as u32, th as u32, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_preserves_mean_and_bounds() {
+        let src = ImageBufferF32::new(400, 200, vec![[0.25, 0.5, 0.75]; 400 * 200]);
+        let p = make_preview(&src, 100);
+        assert_eq!((p.width, p.height), (100, 50));
+        assert!(p.pixels.iter().all(|px| (px[1] - 0.5).abs() < 1.0e-6));
+    }
+
+    #[test]
+    fn cpu_default_render_is_display_transform_only() {
+        let src = ImageBufferF32::new(2, 1, vec![[0.18; 3], [1.0; 3]]);
+        let out = process_buffer(&src, &DevelopParameters::default(), None);
+        assert_eq!(&out.display_rgba[4..7], &[255, 255, 255]);
+        assert!((117..=119).contains(&out.display_rgba[0]));
+        assert!(!out.used_gpu);
+    }
 }

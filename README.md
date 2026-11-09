@@ -25,7 +25,7 @@ The image decoder currently uses the `image` crate with JPEG, PNG, TIFF, and Web
 
 XMP synchronization currently covers core develop values such as exposure, contrast, highlights, shadows, whites, blacks, temperature, and tint. It does not yet round-trip every Halation control or provide full Adobe XMP compatibility.
 
-MobileSAM weights are not committed. The optional inference workflow expects `encoder.onnx` and `decoder.onnx` under `models/mobilesam/mobilesam-onnx-float/`; the model's companion `.data` files must remain beside their ONNX files. Model download and use are separate from the normal build.
+MobileSAM weights are not committed. The optional inference workflow accepts either `encoder.onnx` + `decoder.onnx`, or the `mobilesam_encoder_quant.onnx` / `mobilesam_decoder_quant.onnx` names. Put them in `models/mobilesam/mobilesam-onnx-float/`, `assets/models/mobilesam/`, or point `HALATION_MODELS` at the containing folder; the model's companion `.data` files must remain beside their ONNX files. Model download and use are separate from the normal build.
 
 The project is under active development. Treat it as a development build, keep backups of source photos, and verify exported files before using them in a production workflow.
 
@@ -69,10 +69,10 @@ The normal application build does not download model weights. To fetch and valid
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install requests onnx
-python model.py
+python utils/model.py
 ```
 
-The script downloads the ONNX archive and extracts it beneath `models/mobilesam/`. The app expects the model files in `models/mobilesam/mobilesam-onnx-float/`. Model weights are ignored by Git and should not be committed.
+The script downloads the ONNX archive and extracts it beneath `models/mobilesam/`. The app searches that location, `assets/models/`, the executable's folder, and `HALATION_MODELS`. Model weights are ignored by Git and should not be committed.
 
 ## Local data
 
@@ -111,7 +111,7 @@ assets/                  Shader and application assets
 
 ## Development roadmap
 
-The project is being built in phases. The current work is focused on catalog performance and culling; broader RAW support, more complete XMP interoperability, and additional AI workflows remain in progress. The detailed design and implementation notes are available in [design.md](design.md), [requirements.md](requirements.md), and [implementation-plan.md](implementation-plan.md).
+The project is being built in phases. The current work is focused on catalog performance and culling; broader RAW support, more complete XMP interoperability, and additional AI workflows remain in progress. The detailed design and implementation notes are available in [design.md](docs/design.md), [requirements.md](docs/requirements.md), and [implementation-plan.md](docs/implementation-plan.md).
 
 ## Contributing
 
@@ -119,4 +119,4 @@ Bug reports and focused contributions are welcome. Please include your Windows v
 
 ## License
 
-No license file is included yet. Until a license is added, this repository is publicly viewable but reuse and redistribution are not granted.
+Halation is released under the MIT License. See [LICENSE](LICENSE) for details.

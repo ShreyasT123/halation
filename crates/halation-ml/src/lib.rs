@@ -1,162 +1,521 @@
-use image::{imageops::FilterType, GenericImageView, GrayImage, ImageBuffer, Luma};
+//! halation-ml — on-device vision (Sprint 8). No sockets, no cloud: ONNX Runtime with DirectML
+//! (Windows), CoreML (macOS) or CPU (Linux / fallback).
+//!
+//! Two decoupled stages:
+//! 1. [`VisionEngine::embed`] — run once per opened photo on a background task: MobileSAM image encoder
+//!    (INT8) → `[1, 256, 64, 64]` embedding, cached in an [`Embedding`].
+//! 2. [`VisionEngine::decode`] / [`VisionEngine::select`] — the lightweight prompt decoder on the cached
+//!    embedding; this is the interactive path (target < 15 ms on a GPU provider).
+//!
+//! Models (not bundled; drop them into `assets/models/`, `assets/models/mobilesam/`, or point
+//! `HALATION_MODELS` at the directory): `mobilesam_encoder_quant.onnx` plus either
+//! `mobilesam_decoder_quant.onnx` (compact 3-input MobileSAM export) or `mobilesam_decoder.onnx`
+//! (official 6-input SAM export with `mask_input, has_mask_input, orig_im_size`). The compact form
+//! is detected automatically and gets 0..1 encoder preprocessing; the official form gets SAM's
+//! mean/std normalization.
+//!
+//! Cargo: `ort = { version = "=2.0.0-rc.10", features = ["directml", "coreml"] }` (enable per target),
+//! `thiserror`, `halation-core`.
+
+pub mod mask;
+
+use halation_core::{AiMaskKind, MaskBuffer};
+use mask::{automatic_prompts, logits_to_mask, preprocess_for_encoder, EncoderNorm, Prompt};
 use ort::{
-    execution_providers::DirectMLExecutionProvider,
+    execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
     session::{builder::GraphOptimizationLevel, Session},
-    value::Tensor,
+    value::{Tensor, ValueType},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+use thiserror::Error;
 
-const MODEL_SIZE: u32 = 1024;
-const MASK_SIZE: u32 = 256;
+pub const ENCODER_FILE: &str = "mobilesam_encoder_quant.onnx";
+pub const DECODER_FILE: &str = "mobilesam_decoder.onnx";
+const EMBEDDING_LEN: usize = 256 * 64 * 64;
 
-pub struct MobileSam {
-    encoder: Session,
-    decoder: Session,
-    embedding: Option<([u32; 2], Vec<f32>)>,
-    cached_path: Option<PathBuf>,
+/// Filenames seen in the wild for the MobileSAM encoder. The first entry is the documented name.
+const ENCODER_FILES: &[&str] = &[
+    "mobilesam_encoder_quant.onnx",
+    "mobilesam_encoder.onnx",
+    "encoder_quant.onnx",
+    "encoder.onnx",
+];
+/// Filenames seen in the wild for the MobileSAM decoder. The official export omits `_quant` on the
+/// decoder even when the encoder is quantised, so both spellings are accepted.
+const DECODER_FILES: &[&str] = &[
+    "mobilesam_decoder_quant.onnx",
+    "mobilesam_decoder.onnx",
+    "decoder_quant.onnx",
+    "decoder.onnx",
+];
+
+#[derive(Debug, Error)]
+pub enum MlError {
+    #[error("model file missing: {0}")]
+    MissingModel(PathBuf),
+    #[error("model files not found in {0} (expected mobilesam_encoder_quant.onnx and mobilesam_decoder*.onnx)")]
+    MissingModels(PathBuf),
+    #[error("onnx runtime: {0}")]
+    Ort(String),
+    #[error("unexpected model output: {0}")]
+    Shape(String),
+    #[error("engine lock poisoned")]
+    Poisoned,
 }
 
-impl MobileSam {
-    pub fn load(model_dir: &Path) -> Result<Self, String> {
-        let encoder_path = model_dir.join("encoder.onnx");
-        let decoder_path = model_dir.join("decoder.onnx");
-        if !encoder_path.is_file() || !decoder_path.is_file() {
-            return Err(format!(
-                "MobileSAM encoder/decoder not found in {}",
-                model_dir.display()
-            ));
+fn ort_err(e: impl std::fmt::Display) -> MlError {
+    MlError::Ort(e.to_string())
+}
+
+fn find_in_dir(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names.iter().map(|n| dir.join(n)).find(|p| p.is_file())
+}
+
+fn candidate_dirs(base: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
         }
-        let make_session = |path: &Path| -> Result<Session, String> {
-            let builder = Session::builder()
-                .map_err(|e| e.to_string())?
-                .with_optimization_level(GraphOptimizationLevel::Level1)
-                .map_err(|e| e.to_string())?;
-            // DirectML is preferred on Windows; ONNX Runtime keeps CPU as fallback.
-            let with_directml = builder
-                .with_execution_providers([DirectMLExecutionProvider::default().build()])
-                .map_err(|e| e.to_string())?;
-            match with_directml.clone().commit_from_file(path) {
-                Ok(session) => Ok(session),
-                Err(_) => Session::builder()
-                    .map_err(|e| e.to_string())?
-                    .with_optimization_level(GraphOptimizationLevel::Level1)
-                    .map_err(|e| e.to_string())?
-                    .commit_from_file(path)
-                    .map_err(|e| e.to_string()),
+    };
+    push(base.to_path_buf());
+    for sub in ["mobilesam", "mobilesam-onnx-float", "mobilesam-onnx"] {
+        push(base.join(sub));
+        push(base.join(sub).join("mobilesam-onnx-float"));
+    }
+    // A shallow scan covers layouts such as `models/mobilesam/mobilesam-onnx-float`.
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.flatten().take(64) {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            push(p.clone());
+            push(p.join("mobilesam-onnx-float"));
+        }
+    }
+    dirs
+}
+
+/// Find a matching encoder/decoder pair below `base`. Accepts the common filenames and the
+/// `mobilesam/` subdirectory layout.
+pub fn find_models(base: &Path) -> Option<(PathBuf, PathBuf)> {
+    for dir in candidate_dirs(base) {
+        if let (Some(enc), Some(dec)) = (
+            find_in_dir(&dir, ENCODER_FILES),
+            find_in_dir(&dir, DECODER_FILES),
+        ) {
+            return Some((enc, dec));
+        }
+    }
+    None
+}
+
+/// Whether a complete encoder/decoder pair can be found below `base`.
+pub fn has_models(base: &Path) -> bool {
+    find_models(base).is_some()
+}
+
+/// Cached encoder output for one image.
+#[derive(Clone)]
+pub struct Embedding {
+    pub image_id: u64,
+    scale: f32,
+    orig_w: u32,
+    orig_h: u32,
+    data: Arc<Vec<f32>>,
+}
+
+pub struct VisionEngine {
+    encoder: Mutex<Session>,
+    decoder: Mutex<Session>,
+    provider: &'static str,
+    /// Whether the decoder is the official 6-input SAM export.
+    full_decoder: bool,
+    /// Maximum number of prompt points the decoder accepts (`usize::MAX` when dynamic).
+    point_budget: usize,
+    /// Encoder input normalization matching the decoder variant.
+    norm: EncoderNorm,
+}
+
+fn providers() -> (Vec<ExecutionProviderDispatch>, &'static str) {
+    #[cfg(target_os = "windows")]
+    {
+        use ort::execution_providers::DirectMLExecutionProvider;
+        (
+            vec![
+                DirectMLExecutionProvider::default().build(),
+                CPUExecutionProvider::default().build(),
+            ],
+            "DirectML",
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use ort::execution_providers::CoreMLExecutionProvider;
+        (
+            vec![
+                CoreMLExecutionProvider::default().build(),
+                CPUExecutionProvider::default().build(),
+            ],
+            "CoreML",
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        (vec![CPUExecutionProvider::default().build()], "CPU")
+    }
+}
+
+fn build_session(path: &Path, eps: Vec<ExecutionProviderDispatch>) -> Result<Session, MlError> {
+    if !path.is_file() {
+        return Err(MlError::MissingModel(path.to_path_buf()));
+    }
+    Session::builder()
+        .map_err(ort_err)?
+        .with_execution_providers(eps)
+        .map_err(ort_err)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(ort_err)?
+        .commit_from_file(path)
+        .map_err(ort_err)
+}
+
+fn load_pair(
+    encoder: &Path,
+    decoder: &Path,
+    eps: Vec<ExecutionProviderDispatch>,
+) -> Result<(Session, Session), MlError> {
+    Ok((
+        build_session(encoder, eps.clone())?,
+        build_session(decoder, eps)?,
+    ))
+}
+
+fn tensor_hw(shape: &[i64]) -> Result<(usize, usize), MlError> {
+    let dims: Vec<usize> = shape
+        .iter()
+        .filter(|&&d| d > 0)
+        .map(|&d| d as usize)
+        .collect();
+    if dims.len() < 2 {
+        return Err(MlError::Shape(format!(
+            "mask {shape:?} has no spatial dimensions"
+        )));
+    }
+    Ok((dims[dims.len() - 1], dims[dims.len() - 2]))
+}
+
+fn sample_bilinear(data: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let x = x.clamp(0.0, (w - 1) as f32);
+    let y = y.clamp(0.0, (h - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let top = data[y0 * w + x0] * (1.0 - fx) + data[y0 * w + x1] * fx;
+    let bottom = data[y1 * w + x0] * (1.0 - fx) + data[y1 * w + x1] * fx;
+    top * (1.0 - fy) + bottom * fy
+}
+
+impl VisionEngine {
+    /// Load both models from `model_dir` (or one of its subdirectories). Fails fast with
+    /// [`MlError::MissingModels`] so the UI can simply grey out the AI mask buttons.
+    pub fn new(model_dir: &Path) -> Result<Self, MlError> {
+        let (enc_path, dec_path) = find_models(model_dir)
+            .ok_or_else(|| MlError::MissingModels(model_dir.to_path_buf()))?;
+        let (eps, preferred) = providers();
+        // DirectML does not support every quantised MobileSAM graph. Fall back to CPU when the
+        // preferred provider cannot initialise the sessions.
+        let (encoder, decoder, provider) = match load_pair(&enc_path, &dec_path, eps) {
+            Ok((encoder, decoder)) => (encoder, decoder, preferred),
+            Err(first) => {
+                let cpu = vec![CPUExecutionProvider::default().build()];
+                match load_pair(&enc_path, &dec_path, cpu) {
+                    Ok((encoder, decoder)) => (encoder, decoder, "CPU"),
+                    Err(_) => return Err(first),
+                }
             }
         };
+
+        // The official SAM ONNX export has six decoder inputs; the compact MobileSAM export used by
+        // this project has only the three core ones. Detect which one we loaded and adapt both the
+        // encoder preprocessing and the prompt count.
+        let full_decoder = decoder.inputs.iter().any(|i| i.name == "mask_input");
+        let point_budget = decoder
+            .inputs
+            .iter()
+            .find(|i| i.name == "point_coords")
+            .and_then(|i| match &i.input_type {
+                ValueType::Tensor { dimensions, .. } => dimensions.get(1).copied(),
+                _ => None,
+            })
+            .filter(|&d| d > 0)
+            .map(|d| d as usize)
+            .unwrap_or(usize::MAX);
+        let norm = if full_decoder {
+            EncoderNorm::MeanStd
+        } else {
+            EncoderNorm::ZeroOne
+        };
+
         Ok(Self {
-            encoder: make_session(&encoder_path)?,
-            decoder: make_session(&decoder_path)?,
-            embedding: None,
-            cached_path: None,
+            encoder: Mutex::new(encoder),
+            decoder: Mutex::new(decoder),
+            provider,
+            full_decoder,
+            point_budget,
+            norm,
         })
     }
 
-    /// Produce a full-resolution 8-bit mask from a positive point prompt in
-    /// normalized source-image coordinates (0..1).
-    pub fn select_point(&mut self, image_path: &Path, point: [f32; 2]) -> Result<Mask, String> {
-        let canonical = image_path
-            .canonicalize()
-            .unwrap_or_else(|_| image_path.to_path_buf());
-        if self.cached_path.as_deref() != Some(canonical.as_path()) {
-            let image = image::open(image_path)
-                .map_err(|e| e.to_string())?
-                .to_rgb8();
-            self.embedding = Some(self.encode(&image)?);
-            self.cached_path = Some(canonical);
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    /// Stage 1 (background): encode `rgb` (8-bit, `width·height·3`) into an [`Embedding`].
+    pub fn embed(
+        &self,
+        image_id: u64,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Embedding, MlError> {
+        if width == 0 || height == 0 || rgb.len() != width as usize * height as usize * 3 {
+            return Err(MlError::Shape("image buffer size".into()));
         }
-        let (scaled, embedding) = self
-            .embedding
-            .as_ref()
-            .ok_or("MobileSAM embedding was not produced")?;
-        let x = point[0].clamp(0.0, 1.0) * scaled[0] as f32;
-        let y = point[1].clamp(0.0, 1.0) * scaled[1] as f32;
-        let embedding_tensor = Tensor::from_array(([1usize, 256, 64, 64], embedding.clone()))
-            .map_err(|e| e.to_string())?;
-        let coords = Tensor::from_array(([1usize, 1, 2], vec![x, y])).map_err(|e| e.to_string())?;
-        let labels = Tensor::from_array(([1usize, 1], vec![1.0_f32])).map_err(|e| e.to_string())?;
-        let outputs = self
-            .decoder
-            .run(
-                ort::inputs![
-                    "image_embeddings" => embedding_tensor,
-                    "point_coords" => coords,
-                    "point_labels" => labels,
-                ]
-                .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-        let (_, logits) = outputs["masks"]
+        let (input, scale) =
+            preprocess_for_encoder(rgb, width as usize, height as usize, self.norm);
+        let tensor = Tensor::from_array(([1usize, 3, mask::SAM_INPUT, mask::SAM_INPUT], input))
+            .map_err(ort_err)?;
+        let session = self.encoder.lock().map_err(|_| MlError::Poisoned)?;
+        let (in_name, out_name) = (
+            session.inputs[0].name.clone(),
+            session.outputs[0].name.clone(),
+        );
+        let inputs = ort::inputs![in_name.as_str() => tensor].map_err(ort_err)?;
+        let outputs = session.run(inputs).map_err(ort_err)?;
+        let (shape, data) = outputs[out_name.as_str()]
             .try_extract_raw_tensor::<f32>()
-            .map_err(|e| e.to_string())?;
-        let low = GrayImage::from_raw(
-            MASK_SIZE,
-            MASK_SIZE,
-            logits
-                .iter()
-                .map(|v| if *v > 0.0 { 255 } else { 0 })
-                .collect(),
-        )
-        .ok_or("MobileSAM returned an invalid mask tensor")?;
-        let padded = image::imageops::resize(&low, MODEL_SIZE, MODEL_SIZE, FilterType::Triangle);
-        let scaled_mask = image::imageops::crop_imm(&padded, 0, 0, scaled[0], scaled[1]).to_image();
-        let original = image::open(image_path).map_err(|e| e.to_string())?;
-        let (width, height) = original.dimensions();
-        let full = image::imageops::resize(&scaled_mask, width, height, FilterType::Nearest);
-        Ok(Mask {
-            width,
-            height,
-            pixels: full.into_raw(),
+            .map_err(ort_err)?;
+        if data.len() != EMBEDDING_LEN {
+            return Err(MlError::Shape(format!(
+                "embedding {shape:?} has {} values, expected {EMBEDDING_LEN}",
+                data.len()
+            )));
+        }
+        Ok(Embedding {
+            image_id,
+            scale,
+            orig_w: width,
+            orig_h: height,
+            data: Arc::new(data.to_vec()),
         })
     }
 
-    fn encode(&mut self, image: &image::RgbImage) -> Result<([u32; 2], Vec<f32>), String> {
-        let scale = MODEL_SIZE as f32 / image.width().max(image.height()) as f32;
-        let width = ((image.width() as f32 * scale).round() as u32).clamp(1, MODEL_SIZE);
-        let height = ((image.height() as f32 * scale).round() as u32).clamp(1, MODEL_SIZE);
-        let resized = image::imageops::resize(image, width, height, FilterType::Triangle);
-        let mut chw = vec![0.0_f32; 3 * MODEL_SIZE as usize * MODEL_SIZE as usize];
-        let plane = (MODEL_SIZE * MODEL_SIZE) as usize;
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = resized.get_pixel(x, y).0;
-                let index = (y * MODEL_SIZE + x) as usize;
-                chw[index] = pixel[0] as f32 / 255.0;
-                chw[plane + index] = pixel[1] as f32 / 255.0;
-                chw[2 * plane + index] = pixel[2] as f32 / 255.0;
+    /// Stage 2 (interactive): decode a soft mask from prompt points. `out_long_edge` bounds the mask
+    /// resolution (the GPU resamples it bilinearly, 512 is plenty and keeps this under ~15 ms).
+    pub fn decode(
+        &self,
+        emb: &Embedding,
+        prompts: &[Prompt],
+        out_long_edge: u32,
+    ) -> Result<MaskBuffer, MlError> {
+        let (ow, oh) = (emb.orig_w as f32, emb.orig_h as f32);
+        let shrink = (out_long_edge as f32 / ow.max(oh)).min(1.0);
+        let (mw, mh) = (
+            ((ow * shrink).round() as u32).max(1),
+            ((oh * shrink).round() as u32).max(1),
+        );
+
+        // Some MobileSAM exports only accept a single prompt point. Keep the most recent points if
+        // the caller supplied more than the decoder's static input dimension allows.
+        let prompts = if prompts.len() > self.point_budget {
+            &prompts[prompts.len() - self.point_budget..]
+        } else {
+            prompts
+        };
+
+        let mut coords = Vec::with_capacity((prompts.len() + 1) * 2);
+        let mut labels = Vec::with_capacity(prompts.len() + 1);
+        for p in prompts {
+            coords.extend([
+                p.x.clamp(0.0, 1.0) * ow * emb.scale,
+                p.y.clamp(0.0, 1.0) * oh * emb.scale,
+            ]);
+            labels.push(p.label);
+        }
+        // SAM's padding point only fits when the decoder has a free prompt slot.
+        if prompts.len() < self.point_budget {
+            coords.extend([0.0, 0.0]);
+            labels.push(-1.0);
+        }
+        if labels.is_empty() {
+            coords.extend([ow * emb.scale * 0.5, oh * emb.scale * 0.5]);
+            labels.push(1.0);
+        }
+        let n = labels.len();
+
+        let embeddings = Tensor::from_array(([1usize, 256, 64, 64], emb.data.as_ref().clone()))
+            .map_err(ort_err)?;
+        let point_coords = Tensor::from_array(([1usize, n, 2], coords)).map_err(ort_err)?;
+        let point_labels = Tensor::from_array(([1usize, n], labels)).map_err(ort_err)?;
+
+        let session = self.decoder.lock().map_err(|_| MlError::Poisoned)?;
+        let output_name = session
+            .outputs
+            .iter()
+            .find(|o| o.name == "masks")
+            .or_else(|| session.outputs.first())
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| "masks".to_owned());
+
+        // The official SAM export takes the extra mask/size inputs; the compact MobileSAM export
+        // does not. Only pass the inputs the loaded graph declares.
+        let (shape, logits) = if self.full_decoder {
+            let mask_input = Tensor::from_array(([1usize, 1, 256, 256], vec![0.0f32; 256 * 256]))
+                .map_err(ort_err)?;
+            let has_mask_input = Tensor::from_array(([1usize], vec![0.0f32])).map_err(ort_err)?;
+            let orig_im_size =
+                Tensor::from_array(([2usize], vec![mh as f32, mw as f32])).map_err(ort_err)?;
+            let inputs = ort::inputs![
+                "image_embeddings" => embeddings,
+                "point_coords" => point_coords,
+                "point_labels" => point_labels,
+                "mask_input" => mask_input,
+                "has_mask_input" => has_mask_input,
+                "orig_im_size" => orig_im_size,
+            ]
+            .map_err(ort_err)?;
+            let outputs = session.run(inputs).map_err(ort_err)?;
+            let (shape, data) = outputs[output_name.as_str()]
+                .try_extract_raw_tensor::<f32>()
+                .map_err(ort_err)?;
+            (shape.to_vec(), data.to_vec())
+        } else {
+            let inputs = ort::inputs![
+                "image_embeddings" => embeddings,
+                "point_coords" => point_coords,
+                "point_labels" => point_labels,
+            ]
+            .map_err(ort_err)?;
+            let outputs = session.run(inputs).map_err(ort_err)?;
+            let (shape, data) = outputs[output_name.as_str()]
+                .try_extract_raw_tensor::<f32>()
+                .map_err(ort_err)?;
+            (shape.to_vec(), data.to_vec())
+        };
+
+        let (lw, lh) = tensor_hw(&shape)?;
+        let (mw_us, mh_us) = (mw as usize, mh as usize);
+        let data = if (lw, lh) == (mw_us, mh_us) {
+            if logits.len() < mw_us * mh_us {
+                return Err(MlError::Shape(format!(
+                    "mask {shape:?} smaller than {mw}×{mh}"
+                )));
+            }
+            logits[..mw_us * mh_us].to_vec()
+        } else {
+            // The compact export returns a square low-resolution mask covering the padded 1024²
+            // encoder input. The official export returns the requested image rectangle. Resample
+            // either layout to the requested mask size.
+            let content_w = emb.orig_w as f32 * emb.scale;
+            let content_h = emb.orig_h as f32 * emb.scale;
+            let padded = !self.full_decoder;
+            let mut out = Vec::with_capacity(mw_us * mh_us);
+            for y in 0..mh_us {
+                for x in 0..mw_us {
+                    let (sx, sy) = if padded {
+                        let cx = (x as f32 + 0.5) / mw_us as f32 * content_w;
+                        let cy = (y as f32 + 0.5) / mh_us as f32 * content_h;
+                        (
+                            cx / mask::SAM_INPUT as f32 * lw as f32 - 0.5,
+                            cy / mask::SAM_INPUT as f32 * lh as f32 - 0.5,
+                        )
+                    } else {
+                        (
+                            (x as f32 + 0.5) / mw_us as f32 * lw as f32 - 0.5,
+                            (y as f32 + 0.5) / mh_us as f32 * lh as f32 - 0.5,
+                        )
+                    };
+                    out.push(sample_bilinear(&logits, lw, lh, sx, sy));
+                }
+            }
+            out
+        };
+        Ok(logits_to_mask(&data, mw, mh))
+    }
+
+    /// One-click "Select Subject" / "Select Sky" with optional refinement clicks.
+    pub fn select(
+        &self,
+        emb: &Embedding,
+        kind: AiMaskKind,
+        extra: &[Prompt],
+    ) -> Result<MaskBuffer, MlError> {
+        let automatic = automatic_prompts(kind);
+        let mut prompts = Vec::with_capacity(automatic.len() + extra.len());
+        if extra.is_empty() {
+            prompts.extend(automatic);
+        } else {
+            // Keep the primary automatic point alongside the user's refinement clicks.
+            if let Some(first) = automatic.first() {
+                prompts.push(*first);
+            }
+            prompts.extend_from_slice(extra);
+        }
+        if prompts.len() > self.point_budget {
+            if extra.is_empty() {
+                prompts.truncate(self.point_budget);
+            } else {
+                let start = prompts.len().saturating_sub(self.point_budget);
+                prompts = prompts[start..].to_vec();
             }
         }
-        let input =
-            Tensor::from_array(([1usize, 3, MODEL_SIZE as usize, MODEL_SIZE as usize], chw))
-                .map_err(|e| e.to_string())?;
-        let outputs = self
-            .encoder
-            .run(ort::inputs!["image" => input].map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        let (_, embedding) = outputs["image_embeddings"]
-            .try_extract_raw_tensor::<f32>()
-            .map_err(|e| e.to_string())?;
-        Ok(([width, height], embedding.to_vec()))
+        self.decode(emb, &prompts, 512)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Mask {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Mask {
-    pub fn overlay_rgba(&self) -> Result<Vec<u8>, String> {
-        let gray: GrayImage =
-            ImageBuffer::<Luma<u8>, _>::from_raw(self.width, self.height, self.pixels.clone())
-                .ok_or("Invalid mask size")?;
-        let mut overlay = Vec::with_capacity(self.pixels.len() * 4);
-        for pixel in gray.pixels() {
-            overlay.extend_from_slice(&[40, 170, 255, if pixel[0] > 0 { 96 } else { 0 }]);
+    #[test]
+    fn missing_models_fail_before_the_runtime_is_touched() {
+        let dir = std::env::temp_dir().join("halation-no-models");
+        match VisionEngine::new(&dir) {
+            Err(MlError::MissingModels(p)) => assert_eq!(p, dir),
+            other => panic!("expected MissingModels, got {:?}", other.err()),
         }
-        Ok(overlay)
+    }
+
+    #[test]
+    fn finds_models_in_mobilesam_subdirectory() {
+        let root = std::env::temp_dir().join(format!(
+            "halation-models-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let dir = root.join("mobilesam");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ENCODER_FILE), b"x").unwrap();
+        std::fs::write(dir.join("mobilesam_decoder_quant.onnx"), b"x").unwrap();
+        assert!(has_models(&root));
+        let (encoder, decoder) = find_models(&root).unwrap();
+        assert_eq!(encoder, dir.join(ENCODER_FILE));
+        assert_eq!(decoder, dir.join("mobilesam_decoder_quant.onnx"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

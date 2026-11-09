@@ -29,24 +29,34 @@ serde_json = "1.0"
 rayon = "1.10"
 tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 blake3 = "1.5"
+libc = "0.2"
 
 # Math & Graphics
 bytemuck = { version = "1.19", features = ["derive"] }
+glam = "0.25"
 wgpu = "23.0"
+pollster = "1.0"
 
 # Color & Codecs
-moxcms = { version = "0.9", features = ["lut"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "webp"] }
 kamadak-exif = "0.6"
+ab_glyph = "0.2"
+lru = "0.12"
+lz4_flex = "0.11"
 
 # UI & Storage
 iced = { version = "0.13", features = ["wgpu", "canvas", "image", "svg", "advanced", "tokio"] }
+iced_font_awesome = "0.3"
 rfd = "0.15"
 rusqlite = { version = "0.32", features = ["bundled"] }
+x11rb = "0.13"
 
 # Windows platform crate (declared in workspace root; inherited conditionally in crates)
 windows = { version = "0.58", features = [
+    "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_ColorSystem",
     "Win32_UI_WindowsAndMessaging"
 ] }
 

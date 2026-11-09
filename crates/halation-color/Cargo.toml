@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-moxcms = { workspace = true }
-windows = { workspace = true, features = ["Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging"] }
+halation-core = { workspace = true }
+glam = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_ColorSystem"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = { workspace = true }
