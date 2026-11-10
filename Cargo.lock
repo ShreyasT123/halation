@@ -1623,8 +1623,10 @@ dependencies = [
 name = "halation-color"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam",
  "halation-core",
+ "serde",
  "windows 0.58.0",
  "x11rb",
 ]

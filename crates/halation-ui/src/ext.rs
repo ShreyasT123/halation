@@ -45,17 +45,21 @@ pub enum Tool {
     Edit,
     Curve,
     Color,
+    Effects,
+    Detail,
     Mask,
     Export,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 5] = [Tool::Edit, Tool::Curve, Tool::Color, Tool::Mask, Tool::Export];
+    pub const ALL: [Tool; 7] = [Tool::Edit, Tool::Curve, Tool::Color, Tool::Effects, Tool::Detail, Tool::Mask, Tool::Export];
     pub fn label(self) -> &'static str {
         match self {
             Tool::Edit => "Edit",
             Tool::Curve => "Curve",
             Tool::Color => "Color",
+            Tool::Effects => "Effects",
+            Tool::Detail => "Detail",
             Tool::Mask => "Mask",
             Tool::Export => "Export",
         }
@@ -66,8 +70,38 @@ impl Tool {
             Tool::Edit => "sliders",
             Tool::Curve => "chart-line",
             Tool::Color => "palette",
+            Tool::Effects => "wand-magic-sparkles",
+            Tool::Detail => "circle-half-stroke",
             Tool::Mask => "mask",
             Tool::Export => "file-export",
+        }
+    }
+}
+
+/// Which HSL mixer channel the Colour panel is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixerChannel {
+    Hue,
+    Saturation,
+    Luminance,
+}
+
+impl MixerChannel {
+    pub const ALL: [MixerChannel; 3] = [MixerChannel::Hue, MixerChannel::Saturation, MixerChannel::Luminance];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MixerChannel::Hue => "Hue",
+            MixerChannel::Saturation => "Saturation",
+            MixerChannel::Luminance => "Luminance",
+        }
+    }
+
+    pub fn id(self, band: usize) -> halation_core::AdjustId {
+        match self {
+            MixerChannel::Hue => halation_core::AdjustId::MixHue(band),
+            MixerChannel::Saturation => halation_core::AdjustId::MixSat(band),
+            MixerChannel::Luminance => halation_core::AdjustId::MixLum(band),
         }
     }
 }
@@ -234,6 +268,9 @@ pub struct ExtState {
     full_loading: Option<u64>,
     pub tool: Tool,
     pub curve_channel: CurveChannel,
+    pub mixer_channel: MixerChannel,
+    /// The WB eyedropper is armed; the next viewport click samples a neutral target.
+    pub sampling_wb: bool,
     pub clip_overlay: bool,
     pub display: Option<Arc<DisplayTransform>>,
     pub display_name: String,
@@ -268,6 +305,8 @@ impl ExtState {
             full_loading: None,
             tool: Tool::Edit,
             curve_channel: CurveChannel::Rgb,
+            mixer_channel: MixerChannel::Hue,
+            sampling_wb: false,
             clip_overlay: false,
             display: None,
             display_name: "sRGB (built-in)".into(),
@@ -308,6 +347,7 @@ impl ExtState {
         self.embedding = None;
         self.pending_ai = None;
         self.mask = None;
+        self.sampling_wb = false;
         self.history_db.clear();
     }
 }
@@ -329,9 +369,16 @@ pub enum ExtMessage {
     XmpWritten(Result<PathBuf, String>),
     SetTool(Tool),
     CurveChannel(CurveChannel),
+    MixerChannel(MixerChannel),
     CurveReset,
     WheelLum(WheelId, f32),
     WheelReset(WheelId),
+    GradingBlending(f32),
+    GradingBalance(f32),
+    ToggleBw,
+    AutoTone,
+    ResetAdjust(halation_core::AdjustId),
+    ArmWhiteBalance,
     VisionLoaded(Result<VisionHandle, String>),
     Embedded(u64, Result<EmbeddingHandle, String>),
     AiMask(AiMaskKind),
@@ -448,6 +495,24 @@ pub fn on_view_event(state: &mut State, event: ViewEvent) -> Task<Message> {
                 state.ext.compare = Compare::Wipe(d);
             }
             Task::none()
+        }
+        ViewEvent::Sample(u, v) => {
+            let Some(doc) = state.doc.as_ref() else { return Task::none() };
+            let (w, h) = (doc.preview.width as usize, doc.preview.height as usize);
+            if w == 0 || h == 0 {
+                return Task::none();
+            }
+            let x = ((u.clamp(0.0, 1.0) * w as f32) as usize).min(w - 1);
+            let y = ((v.clamp(0.0, 1.0) * h as f32) as usize).min(h - 1);
+            let sample = doc.preview.pixels[y * w + x];
+            let (temperature, tint) = halation_color::solve_white_balance(sample);
+            state.params.temperature = temperature;
+            state.params.tint = tint;
+            state.ext.sampling_wb = false;
+            let params = state.params.clone();
+            history_commit(state, params, Some("White balance eyedropper".into()), String::new());
+            state.status = format!("White balance: {temperature:.0} K, tint {tint:+.0}");
+            request_render(state)
         }
     }
 }
@@ -811,6 +876,7 @@ pub fn update(state: &mut State, message: ExtMessage) -> Task<Message> {
         }
         ExtMessage::SetTool(tool) => {
             state.ext.tool = tool;
+            state.ext.sampling_wb = false;
             if tool == Tool::Mask {
                 return load_vision_task(state);
             }
@@ -818,6 +884,59 @@ pub fn update(state: &mut State, message: ExtMessage) -> Task<Message> {
         }
         ExtMessage::CurveChannel(ch) => {
             state.ext.curve_channel = ch;
+            Task::none()
+        }
+        ExtMessage::MixerChannel(ch) => {
+            state.ext.mixer_channel = ch;
+            Task::none()
+        }
+        ExtMessage::GradingBlending(v) => {
+            state.params.grading.blending = v.clamp(0.0, 100.0);
+            request_render(state)
+        }
+        ExtMessage::GradingBalance(v) => {
+            state.params.grading.balance = v.clamp(-100.0, 100.0);
+            request_render(state)
+        }
+        ExtMessage::ToggleBw => {
+            state.params.bw.enabled = !state.params.bw.enabled;
+            let params = state.params.clone();
+            history_commit(state, params, Some(if state.params.bw.enabled { "Enable B&W" } else { "Disable B&W" }.into()), String::new());
+            request_render(state)
+        }
+        ExtMessage::AutoTone => {
+            let Some(doc) = state.doc.as_ref() else { return Task::none() };
+            let mut luma: Vec<f32> = doc
+                .preview
+                .pixels
+                .iter()
+                .map(|p| p[0] * halation_color::PROPHOTO_LUMA[0] + p[1] * halation_color::PROPHOTO_LUMA[1] + p[2] * halation_color::PROPHOTO_LUMA[2])
+                .collect();
+            let tone = halation_color::auto_tone(&mut luma);
+            state.params.exposure = tone.exposure;
+            state.params.contrast = tone.contrast;
+            state.params.highlights = tone.highlights;
+            state.params.shadows = tone.shadows;
+            state.params.whites = tone.whites;
+            state.params.blacks = tone.blacks;
+            let params = state.params.clone();
+            history_commit(state, params, Some("Auto Tone".into()), String::new());
+            state.status = "Auto Tone applied".into();
+            request_render(state)
+        }
+        ExtMessage::ResetAdjust(id) => {
+            id.set(&mut state.params, id.default_value());
+            let params = state.params.clone();
+            history_commit(state, params, Some(format!("Reset {}", id.history_label())), String::new());
+            request_render(state)
+        }
+        ExtMessage::ArmWhiteBalance => {
+            if state.doc.is_none() {
+                state.status = "Open a photo first".into();
+                return Task::none();
+            }
+            state.ext.sampling_wb = !state.ext.sampling_wb;
+            state.status = if state.ext.sampling_wb { "Click a neutral area to set white balance".into() } else { String::new() };
             Task::none()
         }
         ExtMessage::CurveReset => {

@@ -30,7 +30,7 @@ mod widgets;
 use ext::{ExtMessage, ExtState};
 use grid::{GridMessage, HandleCache};
 use halation_catalog::{Catalog, CatalogItem};
-use halation_core::{DevelopParameters, HistogramData, HistoryGraph, ImageBufferF32, ParamId, Wheel};
+use halation_core::{AdjustId, DevelopParameters, HistogramData, HistoryGraph, ImageBufferF32, ParamId, Wheel};
 use halation_gpu::{GpuDevelopEngine, GpuEngineInfo};
 use halation_pipeline::{make_preview, process_with_context, RenderContext, HISTOGRAM_HEIGHT, HISTOGRAM_WIDTH};
 use halation_raw::{decode_file, decode_thumbnail, read_metadata, RawMetadata, SUPPORTED_EXTENSIONS};
@@ -39,16 +39,17 @@ use widgets::{CurveEdit, HistogramView, Scrubby, WheelId};
 use iced::{
     alignment::{Horizontal, Vertical},
     keyboard::{self, key::Named, Key},
-    widget::{button, column, container, image, mouse_area, row, scrollable, slider, stack, text, Column, Row, Space, Text},
+    widget::{button, column, container, image, row, scrollable, slider, stack, text, Column, Row, Space, Text},
     Background, Border, Color, ContentFit, Element, Font, Length, Padding, Shadow, Size, Subscription, Task, Theme,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 const PREVIEW_MAX: u32 = 2048;
+#[allow(dead_code)]
 const THUMB_MAX: u32 = 192;
 const LEFT_W: f32 = 260.0;
 const RIGHT_W: f32 = 320.0;
@@ -148,7 +149,7 @@ fn tile_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
         shadow: Shadow::default(),
     }
 }
-
+#[allow(dead_code)]
 fn slider_style(modified: bool) -> impl Fn(&Theme, slider::Status) -> slider::Style {
     move |_, status| {
         let thumb = match status {
@@ -311,8 +312,10 @@ pub enum Message {
     Rendered(Arc<RenderResult>),
     Thumbnail(u64, Option<image::Handle>),
     Param(ParamId, f32),
+    Adjust(AdjustId, f32),
     CommitEdit,
     ResetParam(ParamId),
+    ResetAdjust(AdjustId),
     ResetSection(Section),
     ResetAll,
     Undo,
@@ -529,7 +532,7 @@ async fn load_document(id: u64, path: PathBuf) -> Result<Arc<Document>, LoadErro
     let preview = Arc::new(make_preview(&asset.buffer, PREVIEW_MAX));
     Ok(Arc::new(Document { id, filename: asset.filename, metadata: asset.metadata, full_size, preview }))
 }
-
+#[allow(dead_code)]
 async fn make_thumbnail(id: u64, path: PathBuf) -> (u64, Option<image::Handle>) {
     match decode_thumbnail(&path, THUMB_MAX) {
         Ok(t) => (id, Some(image::Handle::from_rgba(t.width, t.height, t.rgba))),
@@ -686,6 +689,23 @@ fn update_inner(state: &mut State, message: Message) -> Task<Message> {
             let (params, label, detail) = (state.params.clone(), None::<String>, String::new());
             commit(state, params, label, detail);
             Task::none()
+        }
+        Message::Adjust(id, v) => {
+            if state.doc.is_none() {
+                return Task::none();
+            }
+            let v = if v.is_finite() { v.clamp(id.min(), id.max()) } else { id.default_value() };
+            if (id.get(&state.params) - v).abs() < 1.0e-6 {
+                return Task::none();
+            }
+            id.set(&mut state.params, v);
+            request_render(state)
+        }
+        Message::ResetAdjust(id) => {
+            id.set(&mut state.params, id.default_value());
+            let params = state.params.clone();
+            commit(state, params, Some(format!("Reset {}", id.history_label())), String::new());
+            request_render(state)
         }
         Message::ResetParam(id) => {
             state.params.reset_param(id);
@@ -1247,6 +1267,7 @@ fn viewport_view(state: &State) -> Element<'static, Message> {
         view: state.ext.view,
         compare: if state.ext.peek { Compare::Peek } else { state.ext.compare },
         background: BG_CANVAS,
+        sampling: state.ext.sampling_wb,
     }
     .view()
 }
@@ -1349,6 +1370,7 @@ fn histogram_block(state: &State) -> Element<'static, Message> {
     container(column![head, graph, info].spacing(8)).padding(12).width(Length::Fill).into()
 }
 
+#[allow(dead_code)]
 fn tool_rail() -> Element<'static, Message> {
     let tool = |name: &'static str, msg: Option<Message>| -> Element<'static, Message> {
         button(label(name, 11, TEXT_PRIMARY))
@@ -1402,11 +1424,27 @@ fn right_panel(state: &State) -> Element<'static, Message> {
             controls = controls.push(container(rows).padding(Padding { top: 10.0, right: 12.0, bottom: 14.0, left: 12.0 }));
         }
     }
+    let eyedropper = button(
+        row![fa("eye-dropper", 11.0, TEXT_SECONDARY), label(if state.ext.sampling_wb { "Click the photo" } else { "WB eyedropper" }, 11, TEXT_SECONDARY)]
+            .spacing(5)
+            .align_y(Vertical::Center),
+    )
+    .padding([4, 10])
+    .style(button_style(state.ext.sampling_wb, ACCENT))
+    .on_press_maybe(state.doc.is_some().then_some(Message::Ext(ExtMessage::ArmWhiteBalance)));
     controls = controls.push(
         container(
-            row![
-                action_button("rotate-left", "Reset all", (!state.params.is_default() && state.doc.is_some()).then_some(Message::ResetAll)),
-                action_button("code-compare", "Before / After", state.doc.is_some().then_some(Message::ToggleComparison))
+            column![
+                row![
+                    eyedropper,
+                    action_button("wand-magic-sparkles", "Auto Tone", state.doc.is_some().then_some(Message::Ext(ExtMessage::AutoTone)))
+                ]
+                .spacing(8),
+                row![
+                    action_button("rotate-left", "Reset all", (!state.params.is_default() && state.doc.is_some()).then_some(Message::ResetAll)),
+                    action_button("code-compare", "Before / After", state.doc.is_some().then_some(Message::ToggleComparison))
+                ]
+                .spacing(8),
             ]
             .spacing(8),
         )

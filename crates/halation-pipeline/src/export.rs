@@ -10,8 +10,9 @@
 //!
 //! Cargo: `image` (png, jpeg, tiff, webp), `ab_glyph = "0.2"`, `rayon`, `halation-color`.
 
-use halation_color::{build_icc_profile, sample_mask, OutputSpace, OutputTransform, PreparedDevelop};
+use halation_color::{build_icc_profile, sample_mask, OutputSpace, OutputTransform, PixelContext, PreparedDevelop};
 use halation_core::{DevelopParameters, ImageBufferF32, MaskBuffer};
+use crate::detail;
 use halation_raw::decode_file;
 use image::{
     codecs::{jpeg::JpegEncoder, png::PngEncoder, tiff::TiffEncoder, webp::WebPEncoder},
@@ -187,23 +188,32 @@ pub fn resize_lanczos3(src: &ImageBufferF32, tw: u32, th: u32) -> ImageBufferF32
 /// Develop to encoded RGB floats in `space` (`w·h·3`, row-major, 0..1).
 pub fn develop_encoded(buffer: &ImageBufferF32, params: &DevelopParameters, mask: Option<&MaskBuffer>, space: OutputSpace) -> Vec<f32> {
     let mask = mask.filter(|m| m.is_valid());
-    let prepared = PreparedDevelop::from_params(params, mask.is_some());
+    let prepared = prepare(buffer, params, mask.is_some());
     let out = OutputTransform::new(space);
-    develop_rows(buffer, mask, &prepared, |p, m| prepared.develop_to_output(p, m, &out))
+    develop_rows(buffer, mask, &prepared, |p, ctx| prepared.0.develop_to_output_ctx(p, ctx, &out))
 }
 
 /// Develop to linear working-space floats (for Linear DNG).
 pub fn develop_linear(buffer: &ImageBufferF32, params: &DevelopParameters, mask: Option<&MaskBuffer>) -> Vec<f32> {
     let mask = mask.filter(|m| m.is_valid());
-    let prepared = PreparedDevelop::from_params(params, mask.is_some());
-    develop_rows(buffer, mask, &prepared, |p, m| prepared.develop_working(p, m))
+    let prepared = prepare(buffer, params, mask.is_some());
+    develop_rows(buffer, mask, &prepared, |p, ctx| prepared.0.develop_working_ctx(p, ctx))
+}
+
+fn prepare(buffer: &ImageBufferF32, params: &DevelopParameters, mask_present: bool) -> (PreparedDevelop, Option<halation_core::DetailMap>) {
+    let mut prepared = PreparedDevelop::from_params(params, mask_present);
+    let aspect = buffer.width as f32 / buffer.height.max(1) as f32;
+    let detail = prepared.needs_detail_map().then(|| detail::build(buffer));
+    let air = detail.as_ref().map_or([0.0; 3], |(_, air)| *air);
+    prepared = prepared.with_detail_context(aspect, air);
+    (prepared, detail.map(|(map, _)| map))
 }
 
 fn develop_rows(
     buffer: &ImageBufferF32,
     mask: Option<&MaskBuffer>,
-    prepared: &PreparedDevelop,
-    f: impl Fn([f32; 3], f32) -> [f32; 3] + Sync,
+    (prepared, detail): &(PreparedDevelop, Option<halation_core::DetailMap>),
+    f: impl Fn([f32; 3], &PixelContext) -> [f32; 3] + Sync,
 ) -> Vec<f32> {
     let (w, h) = (buffer.width as usize, buffer.height as usize);
     let mut out = vec![0.0f32; w * h * 3];
@@ -214,7 +224,13 @@ fn develop_rows(
                 Some(mask) if prepared.has_local() => sample_mask(mask, (x as f32 + 0.5) / w as f32, v),
                 _ => 0.0,
             };
-            o.copy_from_slice(&f(*px, m));
+            let ctx = PixelContext {
+                mask: m,
+                detail: detail.as_ref().map_or([0.0; 4], |d| d.sample(x, y)),
+                px: [x as f32, y as f32],
+                size: [w as f32, h as f32],
+            };
+            o.copy_from_slice(&f(*px, &ctx));
         }
     });
     out

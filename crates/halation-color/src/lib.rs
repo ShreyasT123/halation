@@ -10,13 +10,14 @@
 //! Cargo: `glam = "0.29"`.
 
 use glam::{DMat3, DVec3, Mat3, Vec3};
-
+mod adjust;
 mod display;
 mod extras;
 mod icc;
 
 pub use icc::build_icc_profile;
 pub use display::{DisplayLut, DisplayProfile, DISPLAY_LUT_SIZE, SHAPER_GAMMA};
+pub use adjust::{auto_tone, solve_white_balance, AutoTone, PixelContext, AUTO_TONE_IDS};
 pub use extras::sample_mask;
 
 // ------------------------------------------------------------------------------------------------
@@ -366,6 +367,7 @@ impl Default for DevelopInputs {
 #[derive(Debug, Clone)]
 pub struct PreparedDevelop {
     extras: Option<Box<extras::Extras>>,
+    adjust: Option<Box<adjust::AdjustPrepared>>,
     lut: Option<std::sync::Arc<DisplayLut>>,
     wb: Mat3,
     to_display: Mat3,
@@ -385,6 +387,7 @@ impl PreparedDevelop {
         let (black_point, inv_range) = black_white_points(i.whites, i.blacks);
         Self {
             extras: None,
+            adjust: None,
             lut: None,
             wb: white_balance_matrix(i.temperature, i.tint),
             to_display: working_to_srgb(),
@@ -417,7 +420,12 @@ impl PreparedDevelop {
     /// Like [`develop`](Self::develop) with the local-adjustment mask value (0..1) at this pixel.
     /// With a display LUT installed the result is already display-encoded.
     pub fn develop_masked(&self, rgb: [f32; 3], mask: f32) -> [f32; 3] {
-        let c = self.stages(rgb, mask);
+        self.develop_masked_ctx(rgb, &PixelContext::masked(mask))
+    }
+
+    /// Context-aware render: local mask, neighbourhood detail maps and pixel position (vignette/grain).
+    pub fn develop_masked_ctx(&self, rgb: [f32; 3], ctx: &PixelContext) -> [f32; 3] {
+        let c = self.stages(rgb, ctx);
         match &self.lut {
             Some(lut) => lut.apply(c.to_array()),
             None => gamut_map(self.to_display * c).to_array(),
@@ -426,17 +434,25 @@ impl PreparedDevelop {
 
     /// Result of every creative stage in the linear working space (before any output transform).
     pub fn develop_working(&self, rgb: [f32; 3], mask: f32) -> [f32; 3] {
-        self.stages(rgb, mask).to_array()
+        self.develop_working_ctx(rgb, &PixelContext::masked(mask))
+    }
+
+    pub fn develop_working_ctx(&self, rgb: [f32; 3], ctx: &PixelContext) -> [f32; 3] {
+        self.stages(rgb, ctx).to_array()
     }
 
     /// Output-referred, *encoded* result in `space` in [0, 1]. Used by export and external-editor
     /// hand-off: it never applies the monitor LUT.
     pub fn develop_to_output(&self, rgb: [f32; 3], mask: f32, out: &OutputTransform) -> [f32; 3] {
-        let d = gamut_map(out.matrix * self.stages(rgb, mask));
+        self.develop_to_output_ctx(rgb, &PixelContext::masked(mask), out)
+    }
+
+    pub fn develop_to_output_ctx(&self, rgb: [f32; 3], ctx: &PixelContext, out: &OutputTransform) -> [f32; 3] {
+        let d = gamut_map(out.matrix * self.stages(rgb, ctx));
         [out.space.encode(d.x), out.space.encode(d.y), out.space.encode(d.z)]
     }
 
-    fn stages(&self, rgb: [f32; 3], mask: f32) -> Vec3 {
+    fn stages(&self, rgb: [f32; 3], ctx: &PixelContext) -> Vec3 {
         let mut c = (self.wb * Vec3::from_array(rgb)).max(Vec3::ZERO);
         c *= self.exposure_gain;
         if self.highlights_ev != 0.0 || self.shadows_ev != 0.0 {
@@ -449,13 +465,38 @@ impl PreparedDevelop {
         if let Some(x) = &self.extras {
             c = x.curves_and_grading(c);
         }
+        if let Some(a) = &self.adjust {
+            c = a.parametric(c);
+        }
         if self.vibrance != 0.0 || self.saturation != 0.0 {
             c = vibrance_saturation(c, self.vibrance, self.saturation);
         }
+        if let Some(a) = &self.adjust {
+            c = a.dehaze(c, ctx.detail[3]);
+            c = a.detail(c, ctx.detail);
+            c = a.mixer_bw(c);
+        }
         if let Some(x) = &self.extras {
-            c = x.local(c, mask);
+            c = x.local(c, ctx.mask);
+        }
+        if let Some(a) = &self.adjust {
+            c = a.vignette_grain(c, ctx);
         }
         c
+    }
+
+    /// Whether the neighbourhood stage needs the per-pixel detail maps.
+    pub fn needs_detail_map(&self) -> bool {
+        self.adjust.as_ref().is_some_and(|a| a.needs_detail_map())
+    }
+
+    /// Supply the frame aspect ratio and the atmospheric-light estimate used by vignette / dehaze.
+    pub fn with_detail_context(mut self, aspect: f32, air: [f32; 3]) -> Self {
+        if let Some(a) = &mut self.adjust {
+            a.aspect = aspect.max(1.0e-4);
+            a.air = Vec3::from_array(air);
+        }
+        self
     }
 
     /// Same as [`develop`](Self::develop) followed by the sRGB OETF, rounded to 8 bits.
@@ -465,7 +506,11 @@ impl PreparedDevelop {
 
     /// 8-bit display output: LUT-encoded when a display LUT is installed, sRGB otherwise.
     pub fn develop_srgb8_masked(&self, rgb: [f32; 3], mask: f32) -> [u8; 3] {
-        let c = self.develop_masked(rgb, mask);
+        self.develop_srgb8_ctx(rgb, &PixelContext::masked(mask))
+    }
+
+    pub fn develop_srgb8_ctx(&self, rgb: [f32; 3], ctx: &PixelContext) -> [u8; 3] {
+        let c = self.develop_masked_ctx(rgb, ctx);
         if self.lut.is_some() {
             return [to8(c[0]), to8(c[1]), to8(c[2])];
         }

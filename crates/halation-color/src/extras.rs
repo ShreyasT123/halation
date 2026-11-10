@@ -22,11 +22,20 @@ struct LocalPrepared {
     invert: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GradePrepared {
+    terms: [[f32; 4]; 4],
+    /// Zone-boundary spread, 0.5 ..= 1.5 (default 1.0).
+    spread: f32,
+    /// Boundary shift in stops, positive favours highlights.
+    shift: f32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Extras {
     segments: Vec<SplineSegment>,
     counts: [u32; 4],
-    grading: Option<[[f32; 4]; 4]>,
+    grading: Option<GradePrepared>,
     local: Option<LocalPrepared>,
 }
 
@@ -83,18 +92,19 @@ impl Extras {
 }
 
 /// Shadows / midtones / highlights weights from stops-from-gray, then a multiplicative gain per zone.
-fn grade(c: Vec3, g: &[[f32; 4]; 4]) -> Vec3 {
+/// `spread` widens the zone overlap and `shift` moves the shadow/highlight boundary in stops.
+fn grade(c: Vec3, g: &GradePrepared) -> Vec3 {
     let l = c.dot(Vec3::from_array(PROPHOTO_LUMA));
     let (ws, wm, wh) = if l > MIN_LUMA {
         let s = (l / MID_GRAY).log2();
-        let ws = 1.0 - smoothstep(-4.0, 0.0, s);
-        let wh = smoothstep(0.0, 3.0, s);
+        let ws = 1.0 - smoothstep(-4.0 * g.spread - g.shift, -g.shift, s);
+        let wh = smoothstep(-g.shift, 3.0 * g.spread - g.shift, s);
         (ws, (1.0 - ws - wh).max(0.0), wh)
     } else {
         (1.0, 0.0, 0.0)
     };
     let term = |t: &[f32; 4], w: f32| (Vec3::new(t[0], t[1], t[2]) + Vec3::splat(t[3])) * w;
-    let gain = Vec3::ONE + term(&g[0], ws) + term(&g[1], wm) + term(&g[2], wh) + term(&g[3], 1.0);
+    let gain = Vec3::ONE + term(&g.terms[0], ws) + term(&g.terms[1], wm) + term(&g.terms[2], wh) + term(&g.terms[3], 1.0);
     (c * gain).max(Vec3::ZERO)
 }
 
@@ -138,8 +148,15 @@ impl PreparedDevelop {
             saturation: p.saturation,
         });
         let (segments, counts) = p.curve.gpu_segments();
-        let grading = (!p.grading.is_neutral()).then(|| {
-            [p.grading.shadows.gain_terms(), p.grading.midtones.gain_terms(), p.grading.highlights.gain_terms(), p.grading.global.gain_terms()]
+        let grading = (!p.grading.is_neutral()).then(|| GradePrepared {
+            terms: [
+                p.grading.shadows.gain_terms(),
+                p.grading.midtones.gain_terms(),
+                p.grading.highlights.gain_terms(),
+                p.grading.global.gain_terms(),
+            ],
+            spread: 0.5 + p.grading.blending.clamp(0.0, 100.0) / 100.0,
+            shift: p.grading.balance.clamp(-100.0, 100.0) / 100.0 * 2.0,
         });
         let k = super::HIGHLIGHT_SHADOW_RANGE_EV / 100.0;
         let local = p.local.as_ref().filter(|l| mask_present && l.has_effect()).map(|l| LocalPrepared {
@@ -154,6 +171,7 @@ impl PreparedDevelop {
         if counts.iter().any(|&n| n > 0) || grading.is_some() || local.is_some() {
             prepared.extras = Some(Box::new(Extras { segments, counts, grading, local }));
         }
+        prepared.adjust = super::adjust::AdjustPrepared::new(p).map(Box::new);
         prepared
     }
 

@@ -7,10 +7,10 @@
 //!
 //! Cargo: `rayon`, `halation-core`, `halation-color`, `halation-gpu`, `halation-raw`.
 
-use halation_color::{sample_mask, DevelopInputs, DisplayLut, DisplayProfile, PreparedDevelop};
+use halation_color::{sample_mask, DevelopInputs, DisplayLut, DisplayProfile, PixelContext, PreparedDevelop};
 use halation_core::{
-    DevelopParameters, GpuDevelopMatrices, GpuDevelopUniforms, GpuExtraUniforms, GpuFrameInputs, GpuMat3x3, HistogramData,
-    ImageBufferF32, LutBuffer, MaskBuffer,
+    DetailMap, DevelopParameters, GpuAdjustUniforms, GpuDevelopMatrices, GpuDevelopUniforms, GpuExtraUniforms, GpuFrameInputs, GpuMat3x3,
+    HistogramData, ImageBufferF32, LutBuffer, MaskBuffer,
 };
 use halation_gpu::GpuDevelopEngine;
 use halation_raw::RawAsset;
@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 pub mod culling;
+pub mod detail;
 pub mod export;
 pub mod external;
 pub mod thumbs;
@@ -124,30 +125,43 @@ pub fn process_with_context(
         return PipelineOutput { width: 1, height: 1, display_rgba, histogram, histogram_rgba, used_gpu: false };
     }
     let mask = ctx.mask.as_deref().filter(|m| m.is_valid());
-    let prepared = PreparedDevelop::from_params(params, mask.is_some())
+    let aspect = buffer.width as f32 / buffer.height.max(1) as f32;
+    let mut prepared = PreparedDevelop::from_params(params, mask.is_some())
         .with_display_lut(ctx.display.as_ref().map(|d| d.lut.clone()));
+    let detail = prepared.needs_detail_map().then(|| detail::build(buffer));
+    let air = detail.as_ref().map_or([0.0; 3], |(_, air)| *air);
+    prepared = prepared.with_detail_context(aspect, air);
+    let detail_map = detail.as_ref().map(|(map, _)| map);
     let gpu_frame = gpu.and_then(|engine| {
         let (segments, counts) = params.curve.gpu_segments();
         let frame = GpuFrameInputs {
             uniforms: GpuDevelopUniforms::from_params(params, counts.iter().sum()),
             matrices: gpu_matrices(&prepared),
             extra: GpuExtraUniforms::build(params, counts, ctx.display.is_some(), ctx.dither, mask.is_some(), ctx.clip_overlay),
+            adjust: GpuAdjustUniforms::build(params, aspect, air),
             segments: &segments,
             lut: ctx.display.as_deref().map(|d| &d.buffer),
             mask,
+            detail: detail_map,
         };
         engine.process(buffer, &frame).ok()
     });
     let (display_rgba, used_gpu) = match gpu_frame {
         Some(rgba) => (rgba, true),
-        None => (render_cpu(buffer, &prepared, mask, ctx.clip_overlay), false),
+        None => (render_cpu(buffer, &prepared, mask, detail_map, ctx.clip_overlay), false),
     };
     let histogram = histogram_parallel(&display_rgba);
     let histogram_rgba = render_histogram_bitmap(&histogram, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT);
     PipelineOutput { width: buffer.width, height: buffer.height, display_rgba, histogram, histogram_rgba, used_gpu }
 }
 
-fn render_cpu(buffer: &ImageBufferF32, prepared: &PreparedDevelop, mask: Option<&MaskBuffer>, clip_overlay: bool) -> Vec<u8> {
+fn render_cpu(
+    buffer: &ImageBufferF32,
+    prepared: &PreparedDevelop,
+    mask: Option<&MaskBuffer>,
+    detail: Option<&DetailMap>,
+    clip_overlay: bool,
+) -> Vec<u8> {
     let (w, h) = (buffer.width as usize, buffer.height as usize);
     let mut rgba = vec![255u8; buffer.pixels.len() * 4];
     rgba.par_chunks_exact_mut(w * 4).zip(buffer.pixels.par_chunks_exact(w)).enumerate().for_each(|(y, (out_row, in_row))| {
@@ -157,7 +171,13 @@ fn render_cpu(buffer: &ImageBufferF32, prepared: &PreparedDevelop, mask: Option<
                 Some(mask) if prepared.has_local() => sample_mask(mask, (x as f32 + 0.5) / w as f32, v),
                 _ => 0.0,
             };
-            let mut c = prepared.develop_srgb8_masked(*px, m);
+            let ctx = PixelContext {
+                mask: m,
+                detail: detail.map_or([0.0; 4], |d| d.sample(x, y)),
+                px: [x as f32, y as f32],
+                size: [w as f32, h as f32],
+            };
+            let mut c = prepared.develop_srgb8_ctx(*px, &ctx);
             if clip_overlay {
                 if c.iter().any(|&v| v >= 254) {
                     c = [255, 34, 34];

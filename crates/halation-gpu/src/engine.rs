@@ -2,7 +2,8 @@
 //!
 //! Bind group 0: 0 `DevelopUniforms` · 1 `GpuDevelopMatrices` · 2 input `Rgba32Float` image ·
 //! 3 output `Rgba8Unorm` storage · 4 `GpuExtraUniforms` · 5 spline segment storage buffer ·
-//! 6 display LUT (3D `Rgba32Float`) · 7 mask (`R8Unorm`) · 8 mask sampler.
+//! 6 display LUT (3D `Rgba32Float`) · 7 mask (`R8Unorm`) · 8 mask sampler ·
+//! 9 `GpuAdjustUniforms` · 10 detail maps (`Rgba32Float`).
 //!
 //! Everything expensive is cached: the input texture per image id, the LUT per LUT id, the mask per
 //! mask id, plus the readback buffer per frame size. A slider drag therefore costs four
@@ -72,6 +73,7 @@ struct EngineState {
     frame: Option<FrameResources>,
     lut: Option<CachedTexture>,
     mask: Option<CachedTexture>,
+    detail: Option<CachedTexture>,
 }
 
 pub struct GpuDevelopEngine {
@@ -83,9 +85,11 @@ pub struct GpuDevelopEngine {
     uniform_buffer: wgpu::Buffer,
     matrix_buffer: wgpu::Buffer,
     extra_buffer: wgpu::Buffer,
+    adjust_buffer: wgpu::Buffer,
     curve_buffer: wgpu::Buffer,
     dummy_lut: CachedTexture,
     dummy_mask: CachedTexture,
+    dummy_detail: CachedTexture,
     state: Mutex<EngineState>,
     info: GpuEngineInfo,
 }
@@ -168,6 +172,8 @@ impl GpuDevelopEngine {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                buffer_entry(9, wgpu::BufferBindingType::Uniform),
+                texture_entry(10, wgpu::TextureViewDimension::D2, false),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -199,6 +205,7 @@ impl GpuDevelopEngine {
         let uniform_buffer = make_buffer("Develop controls", std::mem::size_of::<halation_core::GpuDevelopUniforms>() as u64, uniform_usage);
         let matrix_buffer = make_buffer("Develop matrices", std::mem::size_of::<halation_core::GpuDevelopMatrices>() as u64, uniform_usage);
         let extra_buffer = make_buffer("Develop extras", std::mem::size_of::<halation_core::GpuExtraUniforms>() as u64, uniform_usage);
+        let adjust_buffer = make_buffer("Adjust uniforms", std::mem::size_of::<halation_core::GpuAdjustUniforms>() as u64, uniform_usage);
         let curve_buffer = make_buffer("Tone curve segments", CURVE_BUFFER_BYTES, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
 
         let dummy = |label: &str, dim: wgpu::TextureDimension, size: u32, format: wgpu::TextureFormat| {
@@ -217,6 +224,18 @@ impl GpuDevelopEngine {
         };
         let dummy_lut = dummy("Dummy LUT", wgpu::TextureDimension::D3, 2, wgpu::TextureFormat::Rgba32Float);
         let dummy_mask = dummy("Dummy mask", wgpu::TextureDimension::D2, 1, wgpu::TextureFormat::R8Unorm);
+        let dummy_detail = dummy("Dummy detail", wgpu::TextureDimension::D2, 1, wgpu::TextureFormat::Rgba32Float);
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &dummy_detail._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&[0.0f32; 4]),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(16), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
 
         Ok(Self {
             device,
@@ -227,9 +246,11 @@ impl GpuDevelopEngine {
             uniform_buffer,
             matrix_buffer,
             extra_buffer,
+            adjust_buffer,
             curve_buffer,
             dummy_lut,
             dummy_mask,
+            dummy_detail,
             state: Mutex::new(EngineState::default()),
             info: GpuEngineInfo { backend_name: format!("{:?}", adapter_info.backend), adapter_name: adapter_info.name },
         })
@@ -335,6 +356,27 @@ impl GpuDevelopEngine {
         CachedTexture { id: mask.id, _texture: texture, view }
     }
 
+    fn upload_detail(&self, detail: &halation_core::DetailMap) -> CachedTexture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Detail maps"),
+            size: wgpu::Extent3d { width: detail.width, height: detail.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&detail.data),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(detail.width * 16), rows_per_image: Some(detail.height) },
+            wgpu::Extent3d { width: detail.width, height: detail.height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        CachedTexture { id: detail.id, _texture: texture, view }
+    }
+
     /// Develop `input` (linear ProPhoto) into display-encoded 8-bit RGBA (`width * height * 4` bytes).
     pub fn process(&self, input: &ImageBufferF32, frame: &GpuFrameInputs) -> Result<Vec<u8>, String> {
         if !input.is_valid() {
@@ -370,15 +412,25 @@ impl GpuDevelopEngine {
                 state.mask = Some(self.upload_mask(mask));
             }
         }
+        let detail = frame.detail.filter(|d| d.is_valid());
+        if let Some(detail) = detail {
+            if state.detail.as_ref().map_or(true, |c| c.id != detail.id) {
+                state.detail = Some(self.upload_detail(detail));
+            }
+        }
 
         let mut extra = frame.extra;
         extra.flags[0] = u32::from(lut.is_some());
         if mask.is_none() {
             extra.local_b[2] = 0.0;
         }
+        let mut adjust = frame.adjust;
+        // `air.w` doubles as the "detail maps uploaded" flag for the shader.
+        adjust.air[3] = u32::from(detail.is_some()) as f32;
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&frame.uniforms));
         self.queue.write_buffer(&self.matrix_buffer, 0, bytemuck::bytes_of(&frame.matrices));
         self.queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&extra));
+        self.queue.write_buffer(&self.adjust_buffer, 0, bytemuck::bytes_of(&adjust));
         let segments = &frame.segments[..frame.segments.len().min(4 * MAX_SEGMENTS)];
         if !segments.is_empty() {
             self.queue.write_buffer(&self.curve_buffer, 0, bytemuck::cast_slice(segments));
@@ -386,6 +438,7 @@ impl GpuDevelopEngine {
 
         let lut_view = if lut.is_some() { state.lut.as_ref().map(|c| &c.view) } else { None }.unwrap_or(&self.dummy_lut.view);
         let mask_view = if mask.is_some() { state.mask.as_ref().map(|c| &c.view) } else { None }.unwrap_or(&self.dummy_mask.view);
+        let detail_view = if detail.is_some() { state.detail.as_ref().map(|c| &c.view) } else { None }.unwrap_or(&self.dummy_detail.view);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Develop compute bind group"),
             layout: &self.bind_group_layout,
@@ -399,6 +452,8 @@ impl GpuDevelopEngine {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(lut_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(mask_view) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 9, resource: self.adjust_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(detail_view) },
             ],
         });
 

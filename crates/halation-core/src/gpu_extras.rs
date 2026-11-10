@@ -22,9 +22,11 @@ pub struct GpuExtraUniforms {
     pub local_b: [f32; 4],
     /// `[display LUT enabled, dither enabled, grading enabled, 0]`.
     pub flags: [u32; 4],
+    /// `[blending / 100, balance / 100, 0, 0]` — 3-way grading zone overlap.
+    pub grading: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GpuExtraUniforms>() == 128);
+const _: () = assert!(std::mem::size_of::<GpuExtraUniforms>() == 144);
 
 impl GpuExtraUniforms {
     pub fn build(
@@ -53,6 +55,7 @@ impl GpuExtraUniforms {
             local_a,
             local_b,
             flags: [lut_enabled as u32, dither as u32, (!g.is_neutral()) as u32, clip_overlay as u32],
+            grading: [g.blending / 100.0, g.balance / 100.0, 0.0, 0.0],
         }
     }
 }
@@ -78,13 +81,46 @@ impl LutBuffer {
     }
 }
 
+static NEXT_DETAIL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-pixel neighbourhood maps consumed by the texture / clarity / sharpening / dehaze stages:
+/// `(fine, coarse, sharp, dark)` — log₂ luminance ratios to blurs at three radii plus the normalised
+/// dark channel. `id` identifies the content so the GPU backend can cache the uploaded texture.
+#[derive(Debug, Clone)]
+pub struct DetailMap {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<[f32; 4]>,
+}
+
+impl DetailMap {
+    pub fn new(width: u32, height: u32, data: Vec<[f32; 4]>) -> Self {
+        Self { id: NEXT_DETAIL_ID.fetch_add(1, Ordering::Relaxed), width, height, data }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.width > 0 && self.height > 0 && self.data.len() == self.width as usize * self.height as usize
+    }
+
+    #[inline]
+    pub fn sample(&self, x: usize, y: usize) -> [f32; 4] {
+        if !self.is_valid() {
+            return [0.0; 4];
+        }
+        self.data[y.min(self.height as usize - 1) * self.width as usize + x.min(self.width as usize - 1)]
+    }
+}
+
 /// Everything the develop shader needs besides the image itself.
 pub struct GpuFrameInputs<'a> {
     pub uniforms: GpuDevelopUniforms,
     pub matrices: GpuDevelopMatrices,
     pub extra: GpuExtraUniforms,
+    pub adjust: crate::GpuAdjustUniforms,
     /// `4 × MAX_SEGMENTS` spline segments (see `ToneCurve::gpu_segments`).
     pub segments: &'a [SplineSegment],
     pub lut: Option<&'a LutBuffer>,
     pub mask: Option<&'a MaskBuffer>,
+    pub detail: Option<&'a DetailMap>,
 }

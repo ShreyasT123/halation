@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 halation-core = { workspace = true }
 glam = { workspace = true }
+bytemuck = { version = "1.19", features = ["derive"] }
+serde = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_ColorSystem"] }

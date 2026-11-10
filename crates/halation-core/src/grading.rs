@@ -1,4 +1,4 @@
-//! 3-way colour grading (Sprint 4) and local adjustments / masks (Sprint 8) data model.
+﻿//! 3-way colour grading (Sprint 4) and local adjustments / masks (Sprint 8) data model.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +43,7 @@ impl Wheel {
         }
     }
 
-    /// `(Δr, Δg, Δb, Δlum)` gain terms: zero-luma chroma offset of the hue scaled by saturation,
+    /// `(Î”r, Î”g, Î”b, Î”lum)` gain terms: zero-luma chroma offset of the hue scaled by saturation,
     /// plus the luminance lift. The shader applies `c *= 1 + weight * (rgb + w)`.
     pub fn gain_terms(&self) -> [f32; 4] {
         let [r, g, b] = hue_to_rgb(self.hue);
@@ -63,13 +63,30 @@ pub fn hue_to_rgb(hue: f32) -> [f32; 3] {
     [f(5.0), f(3.0), f(1.0)].map(|v| 1.0 - v)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ColorGrading {
     pub shadows: Wheel,
     pub midtones: Wheel,
     pub highlights: Wheel,
     pub global: Wheel,
+    /// How far the zones overlap, 0 ..= 100 (default 50).
+    pub blending: f32,
+    /// Shifts the shadow / highlight boundary, -100 ..= 100 (positive favours highlights).
+    pub balance: f32,
+}
+
+impl Default for ColorGrading {
+    fn default() -> Self {
+        Self {
+            shadows: Wheel::default(),
+            midtones: Wheel::default(),
+            highlights: Wheel::default(),
+            global: Wheel::default(),
+            blending: 50.0,
+            balance: 0.0,
+        }
+    }
 }
 
 impl ColorGrading {
@@ -83,6 +100,8 @@ impl ColorGrading {
             w.sat = if w.sat.is_finite() { w.sat.clamp(0.0, 1.0) } else { 0.0 };
             w.lum = if w.lum.is_finite() { w.lum.clamp(-1.0, 1.0) } else { 0.0 };
         }
+        self.blending = if self.blending.is_finite() { self.blending.clamp(0.0, 100.0) } else { 50.0 };
+        self.balance = if self.balance.is_finite() { self.balance.clamp(-100.0, 100.0) } else { 0.0 };
         self
     }
 

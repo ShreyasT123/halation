@@ -1,14 +1,14 @@
 //! Right-panel tools beyond the slider accordion: tone curve, colour grading wheels, local masks and
 //! export / external editor. All views return owned (`'static`) elements built from `&State`.
 
-use super::{action_button, button_style, fa, h_rule, label, mono, section_header_plain, State, ACCENT, PICK, TEXT_DIM, TEXT_PRIMARY, TEXT_SECONDARY};
+use super::{action_button, button_style, fa, h_rule, label, mono, row_style, section_header_plain, State, ACCENT, PICK, TEXT_DIM, TEXT_PRIMARY, TEXT_SECONDARY};
 use crate::{
-    ext::{ExportScope, ExtMessage, FormatChoice, GradientKind, LocalField, Tool, VisionState},
+    ext::{ExportScope, ExtMessage, FormatChoice, GradientKind, LocalField, MixerChannel, Tool, VisionState},
     widgets::{CurveEditor, WheelId, WheelView},
     Message,
 };
 use halation_color::OutputSpace;
-use halation_core::{AiMaskKind, CurveChannel};
+use halation_core::{AdjustId, AiMaskKind, CurveChannel, BAND_NAMES};
 use iced::{
     alignment::Vertical,
     widget::{button, column, container, progress_bar, row, slider, vertical_slider, Column, Row, Space},
@@ -27,6 +27,47 @@ fn panel(body: impl Into<Element<'static, Message>>) -> Element<'static, Message
     container(body).padding(12).width(Length::Fill).into()
 }
 
+fn adjust_row(state: &State, id: AdjustId) -> Element<'static, Message> {
+    let value = id.get(&state.params);
+    let modified = !id.is_default(&state.params);
+    let reset = button(fa("rotate-left", 9.0, TEXT_DIM))
+        .padding([2, 4])
+        .style(row_style(false))
+        .on_press_maybe(modified.then_some(ext(ExtMessage::ResetAdjust(id))));
+    row![
+        container(label(id.label(), 11, TEXT_SECONDARY)).width(Length::Fixed(70.0)),
+        slider(id.min()..=id.max(), value, move |v| Message::Adjust(id, v))
+            .step(1.0_f32)
+            .on_release(Message::CommitEdit)
+            .width(Length::Fill),
+        container(mono(id.format_value(value), 11, TEXT_SECONDARY)).width(Length::Fixed(44.0)),
+        reset,
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn adjust_group(state: &State, title: &'static str, ids: &[AdjustId]) -> Element<'static, Message> {
+    let mut body = Column::new().spacing(6).push(section_header_plain(title));
+    for id in ids {
+        body = body.push(adjust_row(state, *id));
+    }
+    body.into()
+}
+
+fn value_row(name: &'static str, value: f32, lo: f32, hi: f32, on_change: impl Fn(f32) -> Message + 'static) -> Element<'static, Message> {
+    row![
+        container(label(name, 11, TEXT_SECONDARY)).width(Length::Fixed(70.0)),
+        slider(lo..=hi, value, on_change).step(1.0_f32).on_release(Message::CommitEdit).width(Length::Fill),
+        container(mono(format!("{value:.0}"), 11, TEXT_SECONDARY)).width(Length::Fixed(44.0)),
+        Space::with_width(Length::Fixed(19.0)),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center)
+    .into()
+}
+
 fn tool_tab(tool: Tool, active: bool) -> Element<'static, Message> {
     let color = if active { ACCENT } else { TEXT_PRIMARY };
     button(
@@ -34,18 +75,23 @@ fn tool_tab(tool: Tool, active: bool) -> Element<'static, Message> {
             .spacing(2)
             .align_x(iced::Alignment::Center),
     )
-    .padding([4, 8])
+    .padding([4, 6])
+    .width(Length::Fill)
     .style(button_style(active, ACCENT))
     .on_press(ext(ExtMessage::SetTool(tool)))
     .into()
 }
 
 pub fn tool_tabs(state: &State) -> Element<'static, Message> {
-    let mut tabs = Row::new().spacing(4);
-    for tool in Tool::ALL {
-        tabs = tabs.push(tool_tab(tool, state.ext.tool == tool));
+    let mut rows = Column::new().spacing(4);
+    for chunk in Tool::ALL.chunks(4) {
+        let mut tabs = Row::new().spacing(4);
+        for tool in chunk {
+            tabs = tabs.push(tool_tab(*tool, state.ext.tool == *tool));
+        }
+        rows = rows.push(tabs);
     }
-    container(tabs).padding([8, 12]).width(Length::Fill).into()
+    container(rows).padding([8, 12]).width(Length::Fill).into()
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -93,13 +139,85 @@ fn wheel_cell(state: &State, id: WheelId) -> Element<'static, Message> {
 }
 
 pub fn color_panel(state: &State) -> Element<'static, Message> {
+    let mut body = Column::new()
+        .spacing(12)
+        .push(row![wheel_cell(state, WheelId::Shadows), wheel_cell(state, WheelId::Midtones)].spacing(10))
+        .push(row![wheel_cell(state, WheelId::Highlights), wheel_cell(state, WheelId::Global)].spacing(10))
+        .push(label("Double-click a wheel to reset it", 10, TEXT_DIM));
+
+    body = body
+        .push(h_rule())
+        .push(section_header_plain("BLENDING & BALANCE"))
+        .push(value_row("Blending", state.params.grading.blending, 0.0, 100.0, |v| ext(ExtMessage::GradingBlending(v))))
+        .push(value_row("Balance", state.params.grading.balance, -100.0, 100.0, |v| ext(ExtMessage::GradingBalance(v))));
+
+    body = body.push(h_rule()).push(section_header_plain("HSL / COLOUR MIXER"));
+    let mut channels = Row::new().spacing(4);
+    for channel in MixerChannel::ALL {
+        channels = channels.push(chip_button(channel.label(), state.ext.mixer_channel == channel, Some(ext(ExtMessage::MixerChannel(channel)))));
+    }
+    body = body.push(channels);
+    for band in 0..BAND_NAMES.len() {
+        body = body.push(adjust_row(state, state.ext.mixer_channel.id(band)));
+    }
+
+    body = body
+        .push(h_rule())
+        .push(
+            row![
+                section_header_plain("BLACK & WHITE"),
+                chip_button("Convert", state.params.bw.enabled, Some(ext(ExtMessage::ToggleBw))),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        );
+    if state.params.bw.enabled {
+        for band in 0..BAND_NAMES.len() {
+            body = body.push(adjust_row(state, AdjustId::BwMix(band)));
+        }
+    }
+
+    body = body.push(h_rule()).push(section_header_plain("PARAMETRIC CURVE"));
+    for id in AdjustId::PARAMETRIC {
+        body = body.push(adjust_row(state, id));
+    }
+    body = body.push(label("Region splits", 10, TEXT_DIM));
+    for id in AdjustId::PARAMETRIC_SPLIT {
+        body = body.push(adjust_row(state, id));
+    }
+
+    panel(body)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Effects / Detail
+// ------------------------------------------------------------------------------------------------
+
+pub fn effects_panel(state: &State) -> Element<'static, Message> {
     panel(
         column![
-            row![wheel_cell(state, WheelId::Shadows), wheel_cell(state, WheelId::Midtones)].spacing(10),
-            row![wheel_cell(state, WheelId::Highlights), wheel_cell(state, WheelId::Global)].spacing(10),
-            label("Double-click a wheel to reset it", 10, TEXT_DIM),
+            adjust_group(state, "TEXTURE & CLARITY", &[AdjustId::Texture, AdjustId::Clarity, AdjustId::Dehaze]),
+            h_rule(),
+            adjust_group(
+                state,
+                "VIGNETTE",
+                &[AdjustId::Vignette, AdjustId::VignetteMidpoint, AdjustId::VignetteRoundness, AdjustId::VignetteFeather],
+            ),
+            h_rule(),
+            adjust_group(state, "GRAIN", &[AdjustId::Grain, AdjustId::GrainSize, AdjustId::GrainRoughness]),
+            label("Texture, clarity and dehaze use per-image detail maps.", 10, TEXT_DIM),
         ]
         .spacing(12),
+    )
+}
+
+pub fn detail_panel(state: &State) -> Element<'static, Message> {
+    panel(
+        column![
+            adjust_group(state, "SHARPENING", &AdjustId::DETAIL),
+            label("Detail controls the sharpening radius mix; masking protects flat areas.", 10, TEXT_DIM),
+        ]
+        .spacing(10),
     )
 }
 
@@ -150,7 +268,7 @@ pub fn mask_panel(state: &State) -> Element<'static, Message> {
             body = body.push(
                 row![
                     container(label(field.label(), 11, TEXT_SECONDARY)).width(Length::Fixed(74.0)),
-                    slider(lo..=hi, v, move |x| ext(ExtMessage::LocalParam(field, x))).step(if field == LocalField::Exposure { 0.01 } else { 1.0 }).on_release(Message::CommitEdit).width(Length::Fill),
+                    slider(lo..=hi, v, move |x| ext(ExtMessage::LocalParam(field, x))).step(if field == LocalField::Exposure { 0.01 } else { 1.0_f32 }).on_release(Message::CommitEdit).width(Length::Fill),
                     container(mono(if field == LocalField::Exposure { format!("{v:+.2}") } else { format!("{v:+.0}") }, 11, TEXT_SECONDARY)).width(Length::Fixed(48.0)),
                 ]
                 .spacing(8)
@@ -186,7 +304,7 @@ pub fn export_panel(state: &State) -> Element<'static, Message> {
     let quality: Element<'static, Message> = if ui.format == FormatChoice::Jpeg {
         row![
             container(label("Quality", 11, TEXT_SECONDARY)).width(Length::Fixed(74.0)),
-            slider(1.0..=100.0, ui.quality as f32, |q| ext(ExtMessage::ExportQuality(q))).step(1.0).width(Length::Fill),
+            slider(1.0_f32..=100.0_f32, ui.quality as f32, |q| ext(ExtMessage::ExportQuality(q))).step(1.0_f32).width(Length::Fill),
             container(mono(ui.quality.to_string(), 11, TEXT_SECONDARY)).width(Length::Fixed(40.0)),
         ]
         .spacing(8)
@@ -265,6 +383,8 @@ pub fn tool_content(state: &State) -> Option<Element<'static, Message>> {
         Tool::Edit => None,
         Tool::Curve => Some(curve_panel(state)),
         Tool::Color => Some(color_panel(state)),
+        Tool::Effects => Some(effects_panel(state)),
+        Tool::Detail => Some(detail_panel(state)),
         Tool::Mask => Some(mask_panel(state)),
         Tool::Export => Some(export_panel(state)),
     }

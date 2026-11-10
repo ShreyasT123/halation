@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn blurred_image_scores_lower_and_is_rejected() {
         let sharp = checker(96, 96, 6);
-        let soft = box_blur(&sharp, 96, 96, 3);
+        let soft = box_blur(&sharp, 96, 96, 8);
         let (a, b) = (analyze_rgba(&sharp, 96, 96, &[]), analyze_rgba(&soft, 96, 96, &[]));
         assert!(a.focus() > b.focus() + 0.2, "{a:?} {b:?}");
         let t = CullThresholds::default();

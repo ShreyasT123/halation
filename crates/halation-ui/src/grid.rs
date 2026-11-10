@@ -348,7 +348,7 @@ fn cull_bar(state: &State) -> Element<'static, Message> {
     let slim = |name: &'static str, value: f32, field: CullField| -> Element<'static, Message> {
         row![
             label(name, 10, TEXT_DIM),
-            slider(0.0..=1.0, value, move |v| msg(GridMessage::Threshold(field, v))).step(0.01).width(Length::Fixed(90.0)),
+            slider(0.0..=1.0, value, move |v| msg(GridMessage::Threshold(field, v))).step(0.01_f32).width(Length::Fixed(90.0)),
         ]
         .spacing(6)
         .align_y(Vertical::Center)

@@ -88,6 +88,7 @@ impl Trc {
 #[derive(Debug, Clone)]
 pub struct DisplayProfile {
     pub description: String,
+    #[allow(dead_code)]
     to_pcs: Mat3, // device linear RGB → XYZ (D50)
     from_pcs: Mat3,
     trc: [Trc; 3],
@@ -405,12 +406,12 @@ mod tests {
     #[test]
     fn srgb_lut_reproduces_the_analytic_transform() {
         let lut = DisplayLut::srgb();
-        let to_srgb = super::super::working_to_srgb();
+        let profile = DisplayProfile::srgb();
         for rgb in [[0.18f32; 3], [0.5, 0.2, 0.1], [0.02, 0.4, 0.9], [1.0; 3], [0.0; 3], [0.001; 3]] {
             let got = lut.apply(rgb);
-            let lin = (to_srgb * Vec3::from_array(rgb)).clamp(Vec3::ZERO, Vec3::ONE);
+            let want = profile.from_working(Vec3::from_array(rgb));
             for k in 0..3 {
-                assert!((got[k] - srgb_oetf(lin[k])).abs() < 0.006, "{rgb:?}: {got:?}");
+                assert!((got[k] - want[k]).abs() < 0.006, "{rgb:?}: {got:?} != {want:?}");
             }
         }
     }

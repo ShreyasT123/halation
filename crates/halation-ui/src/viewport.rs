@@ -138,6 +138,8 @@ pub enum Compare {
 pub enum ViewEvent {
     Set(ViewTransform),
     Divider(f32),
+    /// White-balance eyedropper sample in normalised image coordinates.
+    Sample(f32, f32),
 }
 
 /// Native-resolution detail layer drawn over the preview (normalised rect `[x, y, w, h]`).
@@ -155,6 +157,8 @@ pub struct Viewport {
     pub view: ViewTransform,
     pub compare: Compare,
     pub background: Color,
+    /// When armed, a click reports `ViewEvent::Sample` instead of toggling zoom.
+    pub sampling: bool,
 }
 
 #[derive(Default)]
@@ -284,6 +288,12 @@ impl canvas::Program<Message> for Viewport {
                     if let (Some((p, at)), Some(_)) = (state.press.take(), local) {
                         if at.elapsed() < Duration::from_millis(600) && !state.space_down {
                             let pane = self.pane_at(size, p);
+                            if self.sampling {
+                                let r = self.view.image_rect(self.image_size, pane.size());
+                                let u = ((p.x - pane.x - r.x) / r.width.max(1.0)).clamp(0.0, 1.0);
+                                let v = ((p.y - pane.y - r.y) / r.height.max(1.0)).clamp(0.0, 1.0);
+                                return (event::Status::Captured, Some(Message::View(ViewEvent::Sample(u, v))));
+                            }
                             let anchor = Point::new(p.x - pane.x, p.y - pane.y);
                             return emit(self.view.toggled_at(self.image_size, pane.size(), anchor));
                         }
@@ -331,6 +341,9 @@ impl canvas::Program<Message> for Viewport {
 
     fn mouse_interaction(&self, state: &Interaction, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
+        if self.sampling {
+            return mouse::Interaction::Crosshair;
+        }
         if self.wipe_x(bounds.size()).is_some_and(|x| (p.x - x).abs() < 10.0) || state.divider_drag {
             return mouse::Interaction::ResizingHorizontally;
         }

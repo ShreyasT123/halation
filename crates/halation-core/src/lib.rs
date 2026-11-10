@@ -9,13 +9,15 @@ use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 pub mod curve;
 pub mod gpu_extras;
 pub mod grading;
-
+pub mod adjustments;
+pub use adjustments::{
+    AdjustId, BandAdjust, BlackWhite, ColorMixer, Detail, Effects, GpuAdjustUniforms, Parametric, BAND_COUNT, BAND_HUES, BAND_NAMES,
+};
 pub use curve::{CurveChannel, SplineSegment, ToneCurve, MAX_CURVE_POINTS, MAX_SEGMENTS};
-pub use gpu_extras::{GpuExtraUniforms, GpuFrameInputs, LutBuffer};
+pub use gpu_extras::{DetailMap, GpuExtraUniforms, GpuFrameInputs, LutBuffer};
 pub use grading::{AiMaskKind, ColorGrading, LocalAdjustment, MaskBuffer, MaskSource, Wheel};
 
 // ------------------------------------------------------------------------------------------------
@@ -227,6 +229,11 @@ pub struct DevelopParameters {
     pub curve: ToneCurve,
     pub grading: ColorGrading,
     pub local: Option<LocalAdjustment>,
+    pub effects: Effects,
+    pub detail: Detail,
+    pub mixer: ColorMixer,
+    pub bw: BlackWhite,
+    pub parametric: Parametric,
 }
 
 impl Default for DevelopParameters {
@@ -245,6 +252,11 @@ impl Default for DevelopParameters {
             curve: ToneCurve::default(),
             grading: ColorGrading::default(),
             local: None,
+            effects: Effects::default(),
+            detail: Detail::default(),
+            mixer: ColorMixer::default(),
+            bw: BlackWhite::default(),
+            parametric: Parametric::default(),
         }
     }
 }
@@ -311,7 +323,7 @@ impl DevelopParameters {
         self.curve = self.curve.sanitized();
         self.grading = self.grading.sanitized();
         self.local = self.local.map(LocalAdjustment::sanitized);
-        self
+        self.adjust_sanitized()
     }
 
     /// Auto label + detail for a history entry, covering sliders, curves, wheels and local masks.
@@ -327,6 +339,11 @@ impl DevelopParameters {
             }
         }
         labels.extend(self.grading.change_labels(&previous.grading));
+        let adjust = self.adjust_changes_from(previous);
+        labels.extend(adjust.iter().map(|(id, _, to)| format!("{} {}", id.history_label(), id.format_value(*to))));
+        if self.bw.enabled != previous.bw.enabled {
+            labels.push(if self.bw.enabled { "Black & White on" } else { "Black & White off" }.to_owned());
+        }
         if self.local != previous.local {
             labels.push("Local adjustment".to_owned());
         }
@@ -351,6 +368,29 @@ impl DevelopParameters {
             .filter_map(|id| {
                 let (from, to) = (id.get(previous), id.get(self));
                 ((from - to).abs() > 1e-4).then_some(ParamChange { id, from, to })
+            })
+            .collect()
+    }
+
+    fn adjust_sanitized(mut self) -> Self {
+        self.effects = self.effects.sanitized();
+        self.detail = self.detail.sanitized();
+        self.mixer = self.mixer.sanitized();
+        self.bw = self.bw.sanitized();
+        self.parametric = self.parametric.sanitized();
+        for id in AdjustId::ALL {
+            let v = id.get(&self);
+            id.set(&mut self, v);
+        }
+        self
+    }
+
+    fn adjust_changes_from(&self, previous: &Self) -> Vec<(AdjustId, f32, f32)> {
+        AdjustId::ALL
+            .into_iter()
+            .filter_map(|id| {
+                let (from, to) = (id.get(previous), id.get(self));
+                ((from - to).abs() > 1e-4).then_some((id, from, to))
             })
             .collect()
     }
